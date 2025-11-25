@@ -1183,6 +1183,20 @@ class BTBMGSC(TimedBaseBTBPredictor):
 
     numDelay = 2
 
+class BTBPDEDE(TimedBaseBTBPredictor):
+    type = 'BTBPDEDE'
+    cxx_class = 'gem5::branch_prediction::btb_pred::BTBPDEDE'
+    cxx_header = "cpu/pred/btb/btb_pdede.hh"
+
+    numEntries = Param.Unsigned(8192, "Number of entries in the MBTB")
+    tagBits = Param.Unsigned(12, "Number of bits in the tag")
+    pageBits = Param.Unsigned(12, "Number of bits for page offset")
+    instShiftAmt = Param.Unsigned(1, "Amount to shift PC to get inst bits")
+    numThreads = Param.Unsigned(1, "Number of threads")
+    numWays = Param.Unsigned(4, "Number of ways per set")
+    numDelay = 2
+    blockSize = 32  # max 64 byte block, 32 byte aligned
+
 class DecoupledBPUWithBTB(BranchPredictor):
     type = 'DecoupledBPUWithBTB'
     cxx_class = 'gem5::branch_prediction::btb_pred::DecoupledBPUWithBTB'
