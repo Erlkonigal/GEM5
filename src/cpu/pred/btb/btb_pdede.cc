@@ -4,12 +4,17 @@ namespace gem5 {
 namespace branch_prediction {
 namespace btb_pred {
 
-BTBPDEDE::BTBPDEDE(const Params& p):
+BTBPDede::BTBPDede(const Params& p):
     TimedBaseBTBPredictor(p),
     instShiftAmt(p.instShiftAmt),
     numEntries(p.numEntries),
+    numPageEntries(p.numPageEntries),
+    numRegionEntries(p.numRegionEntries),
     numWays(p.numWays),
+    numPageWays(p.numPageWays),
+    numRegionWays(p.numRegionWays),
     tagBits(p.tagBits),
+    tagFoldedBits(p.tagFoldedBits),
     pageBits(p.pageBits)
 {
     /*
@@ -18,8 +23,8 @@ BTBPDEDE::BTBPDEDE(const Params& p):
             // Solution 1
             each bank has 4096 entries
             each entry has 4 ways, 1024 entries per way
-            for way 0 to way 2, offset bits are 0, 4, 7
-            for way 3, offset bits are 11, with PagePointer, optionally RegionPointer
+            for way 0 to way 2, offset bits are 4, 7, 11
+            for way 3, offset bits are 11, with PagePointer
 
             // Solution 2
             each bank has 4096 entries
@@ -27,28 +32,582 @@ BTBPDEDE::BTBPDEDE(const Params& p):
             for way 0 to way 6, offset bits are 0, 4, 5, 7, 9, 11,
             for way 6 to way 7, offset bits are 11, with PagePointer
 
+        Page table:
+            2 align banks use the same page table, totally 128 entries
+            each entry has 8 ways, 16 entries per way
+            each entry in a way has pageBits - log2(numPageWays) bits of tag
+            we use Cat(tag, pagePointer_set) to get the full page offset
+
         We choose Solution 1 when numWays == 4, Solution 2 when numWays == 8
     */
 
-    numAlignBanks = 2;
+    numAlignBanks = predictWidth / blockSize; // 2 align banks
 
-    // TODO: implement Solution 2
-    assert(numWays == 4);
+    assert(numWays == 4 || numWays == 8);
 
-    // TODO: offset bits need profiling to decide
-    const std::vector<unsigned> wayOffsetBits = {0, 4, 7, 11};
-    const std::vector<bool> wayUsesPagePointer = {false, false, false, true};
+    if (numWays == 4) {
+        wayOffsetBits = way4OffsetBits;
+        wayUsePagePointer = way4UsePagePointer;
+    } else if (numWays == 8) {
+        wayOffsetBits = way8OffsetBits;
+        wayUsePagePointer = way8UsePagePointer;
+    }
+
     // Initialize monitor table
-    unsigned numSets = numEntries / (numWays * numAlignBanks); // 2 banks
-    monitorTable.resize(numSets);
-    for (auto& set : monitorTable) {
-        set.reserve(numWays);
-        for (unsigned way = 0; way < numWays; ++way) {
-            unsigned offsetBits = wayOffsetBits[way];
-            set.emplace_back(offsetBits);
+    numSets = numEntries / (numWays * numAlignBanks);
+    monitorTable.resize(numAlignBanks);
+    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
+        monitorTable[bank].resize(numSets);
+        for (unsigned set = 0; set < numSets; ++set) {
+            monitorTable[bank][set].reserve(numWays);
+            for (unsigned way = 0; way < numWays; ++way) {
+                monitorTable[bank][set].emplace_back(
+                    wayOffsetBits[way], wayUsePagePointer[way]);
+            }
+        }
+    }
+    // Initialize page table
+    numPageSets = numPageEntries / numPageWays;
+    pageTable.resize(numPageSets);
+    for (unsigned set = 0; set < numPageSets; ++set) {
+        pageTable[set].resize(numPageWays);
+        for (unsigned way = 0; way < numPageWays; ++way) {
+            pageTable[set][way].tag = 0;
+            pageTable[set][way].ctr = 0;
         }
     }
 
+    // Initialize monitor plru table
+    monitorPLRUTable.resize(numAlignBanks);
+    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
+        monitorPLRUTable[bank].resize(numSets);
+        for (unsigned set = 0; set < numSets; ++set) {
+            monitorPLRUTable[bank][set] = 0;
+        }
+    }
+
+    // Initialize page plru table
+    pagePLRUTable.resize(numPageSets);
+    for (unsigned set = 0; set < numPageSets; ++set) {
+        pagePLRUTable[set] = 0;
+    }
+
+    DPRINTF(BTBPDede, "BTBPDede initialized: numEntries %d, numWays %d, numSets %d, "
+        "tagBits %d, tagFoldedBits %d, pageBits %d, numPageEntries %d, "
+        "numPageWays %d, numPageSets %d\n",
+        numEntries, numWays, numSets, tagBits, tagFoldedBits, pageBits,
+        numPageEntries, numPageWays, numPageSets);
+}
+
+BTBPDede::~BTBPDede()
+{
+
+}
+
+std::shared_ptr<void> BTBPDede::getPredictionMeta()
+{
+    return meta;
+}
+
+unsigned BTBPDede::getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx)
+{
+    // Rotate align bank index based on PC bits to reduce conflicts
+    unsigned alignBankWidth = floorLog2(blockSize);
+    unsigned rotation = (pc >> alignBankWidth) & (numAlignBanks - 1);
+    return (logicBankIdx + rotation) % numAlignBanks;
+}
+
+Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
+{
+    const auto &pageEntry =
+        pageTable[entry.pagePointerSet][entry.pagePointerWay];
+
+    Addr fullTarget = 0;
+    TargetCarry carry = {TargetCarry::TargetCarryEnum::Fit};
+
+    Addr pcUpper = pc & ~mask(pageBits + maxOffsetBits + instShiftAmt);
+    Addr pcUpperPlusOne = pcUpper + (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
+    Addr pcUpperMinusOne = pcUpper - (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
+
+    Addr pcMiddle = pc & ~mask(entry.offsetBits + instShiftAmt);
+    Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.offsetBits + instShiftAmt));
+    Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.offsetBits + instShiftAmt));
+
+    Addr targetLower = entry.targetOffset << instShiftAmt;
+
+    if (entry.usePagePointer) {
+        carry = pageEntry.carry;
+        Addr pageOffset = (pageEntry.tag << floorLog2(numPageSets)) | entry.pagePointerSet;
+        Addr pageSection = pageOffset << (maxOffsetBits + instShiftAmt);
+
+        if (carry.isFit()) {
+            fullTarget = pcUpper | pageSection | targetLower;
+        }
+        else if (carry.isPlusOne()) {
+            fullTarget = pcUpperPlusOne | pageSection | targetLower;
+        }
+        else {
+            fullTarget = pcUpperMinusOne | pageSection | targetLower;
+        }
+    }
+    else {
+        carry = entry.carry;
+
+        if (carry.isFit()) {
+            fullTarget = pcMiddle | targetLower;
+        }
+        else if (carry.isPlusOne()) {
+            fullTarget = pcMiddlePlusOne | targetLower;
+        }
+        else {
+            fullTarget = pcMiddleMinusOne | targetLower;
+        }
+    }
+
+    return fullTarget;
+}
+
+BTBPDede::TargetCarry BTBPDede::computeCarryBits(Addr pc, Addr target, unsigned offsetBits)
+{
+    TargetCarry carry;
+    Addr pcUpper = pc & ~mask(offsetBits + instShiftAmt);
+    Addr pcUpperPlusOne = pcUpper + (1ULL << (offsetBits + instShiftAmt));
+    Addr pcUpperMinusOne = pcUpper - (1ULL << (offsetBits + instShiftAmt));
+
+    Addr targetLower = target & mask(offsetBits + instShiftAmt);
+
+    Addr candidateFit = pcUpper | targetLower;
+    Addr candidatePlusOne = pcUpperPlusOne | targetLower;
+    Addr candidateMinusOne = pcUpperMinusOne | targetLower;
+
+    if (candidateFit == target) {
+        carry.targetCarry = TargetCarry::TargetCarryEnum::Fit;
+    }
+    else if (candidatePlusOne == target) {
+        carry.targetCarry = TargetCarry::TargetCarryEnum::PlusOne;
+    }
+    else {
+        carry.targetCarry = TargetCarry::TargetCarryEnum::MinusOne;
+    }
+
+    return carry;
+}
+
+/*                bits storage example for 8-way PLRU binary tree:
+ *                      bit[6]: ways 7-4 older than ways 3-0
+ *                      /                                  \
+ *            bit[5]: ways 7+6 > 5+4                bit[2]: ways 3+2 > 1+0
+ *            /                    \                /                    \
+ *     bit[4]: way 7>6    bit[3]: way 5>4    bit[1]: way 3>2    bit[0]: way 1>0
+ */
+std::vector<unsigned> BTBPDede::getPLRUVictims(unsigned state, unsigned numWays)
+{
+    assert(isPowerOf2(numWays));
+
+    std::vector<unsigned> ways(numWays);
+
+    if (numWays > 2) {
+        unsigned rightWays = numWays / 2;
+        unsigned leftWays = numWays - rightWays;
+        unsigned leftSubtreeOlder = (state >> (numWays - 2)) & 0x1;
+        unsigned leftSubtreeState = (state >> (rightWays - 1)) & mask(leftWays - 1);
+        unsigned rightSubtreeState = state & mask(rightWays - 1);
+
+        assert(leftWays == rightWays); // numWays is power of 2
+
+        auto leftVictims = getPLRUVictims(leftSubtreeState, leftWays);
+        auto rightVictims = getPLRUVictims(rightSubtreeState, rightWays);
+
+        if (leftSubtreeOlder) {
+            for (auto w : leftVictims) {
+                ways.push_back(w | (1 << floorLog2(leftWays)));
+            }
+            for (auto w : rightVictims) {
+                ways.push_back(w & ~(1 << floorLog2(rightWays)));
+            }
+        }
+        else {
+            for (auto w : rightVictims) {
+                ways.push_back(w & ~(1 << floorLog2(rightWays)));
+            }
+            for (auto w : leftVictims) {
+                ways.push_back(w | (1 << floorLog2(leftWays)));
+            }
+        }
+    }
+    else if (numWays == 2) {
+        ways.push_back(state & 0x1);
+        ways.push_back(!(state & 0x1));
+    }
+    else {
+        assert(false); // should not reach here
+    }
+
+    return ways;
+}
+
+unsigned BTBPDede::getUpdatedPLRUState(unsigned state, unsigned numWays, unsigned touchWay) {
+    assert(isPowerOf2(numWays));
+
+    unsigned updatedState = 0;
+
+    if (numWays > 2) {
+        unsigned rightWays = numWays / 2;
+        unsigned leftWays = numWays - rightWays;
+        unsigned setLeftOlder = !((touchWay >> (floorLog2(numWays) - 1)) & 0x1);
+        unsigned leftSubtreeState = (state >> (rightWays - 1)) & mask(leftWays - 1);
+        unsigned rightSubtreeState = state & mask(rightWays - 1);
+
+        if (setLeftOlder) {
+            unsigned updatedRightState = getUpdatedPLRUState(
+                rightSubtreeState,
+                rightWays,
+                touchWay & mask(floorLog2(rightWays))
+            );
+            updatedState |= (1 << (numWays - 2)); // set left older bit
+            updatedState |= leftSubtreeState << (rightWays - 1);
+            updatedState |= updatedRightState;
+        }
+        else {
+            unsigned updatedLeftState = getUpdatedPLRUState(
+                leftSubtreeState,
+                leftWays,
+                touchWay & mask(floorLog2(leftWays))
+            );
+            updatedState &= ~(1 << (numWays - 2)); // clear left older bit
+            updatedState |= updatedLeftState << (rightWays - 1);
+            updatedState |= rightSubtreeState;
+        }
+
+    }
+    else if (numWays == 2) {
+        updatedState = !(touchWay & 0x1);
+    }
+    else {
+        assert(false); // should not reach here
+    }
+
+    return updatedState;
+}
+
+Addr BTBPDede::getMonitorIdx(Addr pc)
+{
+    unsigned fetchBlockWidth = floorLog2(predictWidth);
+    Addr idx = (pc >> fetchBlockWidth) & (numSets - 1);
+    return idx;
+}
+
+Addr BTBPDede::getMonitorTag(Addr pc)
+{
+    unsigned fetchBlockWidth = floorLog2(predictWidth);
+    unsigned setWidth = floorLog2(numSets);
+    Addr fullTag = pc >> (fetchBlockWidth + setWidth);
+    // use folded xor for higher 8 bits
+    Addr tagHigher = 0;
+    Addr tagLower = fullTag & mask(tagBits - tagFoldedBits);
+    for (unsigned i = 0; i < tagBits; i += tagFoldedBits) {
+        tagHigher ^= (fullTag & mask(tagFoldedBits));
+        fullTag = fullTag >> tagFoldedBits;
+    }
+
+    if (tagFoldedBits == 0) assert(tagHigher == 0);
+
+    return tagLower | (tagHigher << (tagBits - tagFoldedBits));
+}
+
+std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
+{
+    std::vector<MonitorSet> res;
+
+    unsigned alignBankWidth = floorLog2(blockSize);
+    Addr alignedStartAddr = pc & ~(blockSize - 1);
+
+    for (unsigned i = 0; i < numAlignBanks; ++i) {
+        unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
+        Addr alignedAddr = alignedStartAddr + blockSize * i;
+        Addr idx = getMonitorIdx(alignedAddr);
+        auto monitorSet = monitorTable[phyBankIdx][idx];
+        res.push_back(monitorSet);
+    }
+
+    meta->rawMonitorSets = res;
+
+    return res;
+}
+
+Addr BTBPDede::getPageTableIdx(Addr pc) {
+    Addr idx = (pc >> (maxOffsetBits + instShiftAmt)) & (numPageSets - 1);
+    return idx;
+}
+
+Addr BTBPDede::getPageTableTag(Addr pc) {
+    unsigned setWidth = floorLog2(numPageSets);
+    Addr fullTag = pc >> (maxOffsetBits + instShiftAmt + setWidth);
+    return fullTag & mask(pageBits - setWidth);
+}
+
+std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector<MonitorSet> &originEntries)
+{
+    auto monitorEntries = originEntries;
+    std::vector<BTBEntry> btbEntries;
+
+    // collect all valid entries
+    for (unsigned i = 0; i < numAlignBanks; ++i) {
+        auto &bank = monitorEntries[i];
+        Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
+        for (auto &entry: bank) {
+            Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
+            if (!entry.valid) continue;
+            if (entry.tag != getMonitorTag(alignedAddr)) continue;
+            if (branchPC < pc || branchPC >= (pc + predictWidth)) continue;
+
+            BTBEntry btbEntry;
+            btbEntry.valid = true;
+            btbEntry.pc = branchPC;
+            btbEntry.tag = entry.tag;
+            btbEntry.target = getFullTarget(branchPC, entry);
+            btbEntry.isCond = (entry.attr.branchType == BranchAttribute::BranchTypeEnum::Conditional);
+            btbEntry.isIndirect = (entry.attr.branchType == BranchAttribute::BranchTypeEnum::Indirect);
+            btbEntry.isCall = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Push);
+            btbEntry.isReturn = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Pop);
+            btbEntry.size = std::pow(2, instShiftAmt); // assume size is 2^instShiftAmt
+            btbEntries.push_back(btbEntry);
+        }
+    }
+
+    return btbEntries;
+}
+
+void BTBPDede::fillStagePredictions(
+    const std::vector<BTBEntry>& btbEntries,
+    std::vector<FullBTBPrediction>& stagePreds
+)
+{
+    auto checkAscending = [](std::vector<BTBEntry> &es) {
+        Addr last = 0;
+        bool misorder = false;
+        for (auto &entry : es) {
+            if (entry.pc <= last) {
+                misorder = true;
+                break;
+            }
+            last = entry.pc;
+        }
+        if (misorder) {
+            fatal("BTBPDede: BTB entries are not in ascending order of PC!");
+        }
+    };
+
+    FillStageLoop(s) {
+        DPRINTF(BTBPDede, "BTBPDede: assigning prediction for stage %d\n", s);
+        // Copy BTB entries to stage prediction
+        stagePreds[s].btbEntries.clear();
+        for (auto e : btbEntries) {
+            stagePreds[s].btbEntries.push_back(e);
+        }
+        checkAscending(stagePreds[s].btbEntries);
+        if (s == getDelay()) dumpBTBEntries(stagePreds[s].btbEntries);
+
+        stagePreds[s].predTick = curTick();
+
+        stagePreds[s].condTakens.clear();
+        stagePreds[s].indirectTargets.clear();
+    }
+}
+
+void BTBPDede::putPCHistory(
+    Addr startAddr,
+    const boost::dynamic_bitset<> &history,
+    std::vector<FullBTBPrediction> &stagePreds
+)
+{
+    meta = std::make_shared<BTBPDedeMeta>();
+    // Lookup monitor entries
+    auto monitorEntries = getMonitorEntries(startAddr);
+
+    auto processed_entries = processMonitorEntries(startAddr, monitorEntries);
+
+    fillStagePredictions(processed_entries, stagePreds);
+}
+
+unsigned BTBPDede::getTargetDiffBits(Addr pc, Addr target) {
+    Addr diff = (pc >> instShiftAmt) ^ (target >> instShiftAmt);
+    unsigned diffBits = 0;
+    while (diff != 0) {
+        diffBits++;
+        diff = diff >> 1;
+    }
+    return diffBits;
+}
+
+unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPDedeMeta> meta) {
+    Addr pc = exec.pc;
+    Addr target = exec.target;
+    bool isReturn = exec.isReturn;
+
+    Addr alignedPC = pc & ~(blockSize - 1);
+    unsigned alignBankIdx = getRotatedAlignBankIdx(pc, 0);
+
+    auto getSmallestPartitionIdx = [this](unsigned diffBits) -> unsigned {
+        for (unsigned i = 0; i < wayOffsetBits.size(); ++i) {
+            if (diffBits <= wayOffsetBits[i]) {
+                return i;
+            }
+        }
+        return wayOffsetBits.size() - 1;
+    };
+
+    unsigned diffBits = // if is return, we can allocate it to any partition
+        !isReturn ? getTargetDiffBits(pc, target) : 0;
+    unsigned startIdx = getSmallestPartitionIdx(diffBits);
+    unsigned finalIdx = startIdx;
+    bool foundEmpty = false;
+    for (unsigned i = startIdx; i < wayOffsetBits.size(); ++i) {
+        // choose the first way that is empty
+        if (!meta->rawMonitorSets[alignBankIdx][i].valid) {
+            finalIdx = i;
+            foundEmpty = true;
+            break;
+        }
+    }
+
+    /* if !foundEmpty, we use PLRU to choose the way;
+     * NOTE: in this case, PLRU will give numWay victims,
+     *       so we need to filter the ways that are smaller than startIdx,
+     *       and choose the first one among the rest.
+     */
+    if (foundEmpty) return finalIdx;
+
+    auto monitorIdx = getMonitorIdx(alignedPC);
+    auto plruState = monitorPLRUTable[alignBankIdx][monitorIdx];
+    auto plruVictims = getPLRUVictims(plruState, numWays);
+    for (auto way : plruVictims) {
+        if (way >= startIdx) {
+            finalIdx = way;
+            break;
+        }
+    }
+
+    return finalIdx;
+}
+
+void BTBPDede::update(const FetchStream& stream) {
+    if (stream.squashType != SQUASH_CTRL) return;
+    if (!stream.exeTaken) return;
+
+    auto metaFromUpdate =
+        std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
+
+    BranchInfo exec = stream.exeBranchInfo;
+    unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
+    unsigned monitorIdx = getMonitorIdx(exec.pc);
+    unsigned alignedPosition = (exec.pc & (blockSize - 1)) >> instShiftAmt;
+
+    BranchAttribute execAttr({
+        exec.isCond ? BranchAttribute::BranchTypeEnum::Conditional :
+            (exec.isIndirect ? BranchAttribute::BranchTypeEnum::Indirect :
+                BranchAttribute::BranchTypeEnum::Direct),
+        exec.isReturn ? BranchAttribute::RasActionEnum::Pop :
+            (exec.isCall ? BranchAttribute::RasActionEnum::Push :
+                BranchAttribute::RasActionEnum::None)
+    });
+
+
+    // TODO: is really need this check?
+    // bool mispredHitMeta = false;
+    // for (auto &entry : metaFromUpdate->rawMonitorSets[alignedBankIdx]) {
+    //     if (!entry.valid) continue; // skip invalid entries
+    //     if (!(entry.attr.branchType == execAttr.branchType &&
+    //           entry.attr.rasAction == execAttr.rasAction)) continue; // skip different attributes
+    //     if (entry.position != alignedPosition) continue; // skip different position
+    //     mispredHitMeta = true;
+    //     break;
+    // }
+
+    // if mispredHitMeta, we can infer that BTB is not responsible for the misprediction
+    // if (mispredHitMeta) return;
+
+    unsigned targetDiffBits = getTargetDiffBits(exec.pc, exec.target);
+    unsigned partitionIdx = getPartitionIdx(exec, metaFromUpdate);
+    bool usePagePointer = wayUsePagePointer[partitionIdx];
+    MonitorEntry &monitorEntry =
+        monitorTable[alignedBankIdx][monitorIdx][partitionIdx];
+
+    // Update monitor entry
+    monitorEntry.valid = true;
+    monitorEntry.position = alignedPosition;
+    monitorEntry.tag = getMonitorTag(exec.pc);
+    monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.offsetBits);
+    if (usePagePointer && (targetDiffBits > maxOffsetBits)) {
+        Addr pagePointerSet = getPageTableIdx(exec.pc);
+        // check if page entry exists
+        Addr pagePointerWay = 0;
+        bool pageEntryExists = false;
+        for (unsigned way = 0; way < numPageWays; ++way) {
+            auto &pageEntry = pageTable[pagePointerSet][way];
+            Addr newTag = getPageTableTag(exec.pc);
+            Addr entryTag = pageEntry.tag;
+            if (entryTag == newTag) {
+                pagePointerWay = way;
+                pageEntryExists = true;
+                break;
+            }
+        }
+
+        monitorEntry.isCrossPage = true;
+        monitorEntry.pagePointerSet = pagePointerSet;
+        if (pageEntryExists) {
+            monitorEntry.pagePointerWay = pagePointerWay;
+        }
+        else {
+            // choose victim way using PLRU
+            auto plruState = pagePLRUTable[pagePointerSet];
+            auto plruVictims = getPLRUVictims(plruState, numPageWays);
+            pagePointerWay = plruVictims[0]; // choose the first victim
+            monitorEntry.pagePointerWay = pagePointerWay;
+
+            // update page entry
+            auto &pageEntry = pageTable[pagePointerSet][pagePointerWay];
+            pageEntry.tag = getPageTableTag(exec.pc);
+            pageEntry.carry = computeCarryBits(
+                exec.pc,
+                exec.target,
+                maxOffsetBits + pageBits
+            );
+
+            // update page PLRU state
+            unsigned updatedPLRUState = getUpdatedPLRUState(
+                pagePLRUTable[pagePointerSet],
+                numPageWays,
+                pagePointerWay
+            );
+            pagePLRUTable[pagePointerSet] = updatedPLRUState;
+        }
+    }
+    else {
+        monitorEntry.carry = computeCarryBits(
+            exec.pc,
+            exec.target,
+            monitorEntry.offsetBits
+        );
+        monitorEntry.attr = execAttr;
+    }
+
+}
+
+void BTBPDede::printBTBEntry(const BTBEntry& e) {
+    DPRINTF(BTBPDede, "BTBEntry: valid %d, pc:%#lx, tag: %#lx, size:%d, target:%#lx, "
+        "cond:%d, indirect:%d, call:%d, return:%d, always_taken:%d\n",
+        e.valid, e.pc, e.tag, e.size, e.target, e.isCond, e.isIndirect,
+        e.isCall, e.isReturn, e.alwaysTaken);
+
+}
+
+void BTBPDede::dumpBTBEntries(const std::vector<BTBEntry>& es) {
+    DPRINTF(BTBPDede, "BTBEntries:\n");
+    for (const auto &entry : es) {
+        printBTBEntry(entry);
+    }
 }
 
 
