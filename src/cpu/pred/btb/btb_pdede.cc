@@ -129,13 +129,13 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr pcUpperPlusOne = pcUpper + (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
     Addr pcUpperMinusOne = pcUpper - (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
 
-    Addr pcMiddle = pc & ~mask(entry.offsetBits + instShiftAmt);
-    Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.offsetBits + instShiftAmt));
-    Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.offsetBits + instShiftAmt));
+    Addr pcMiddle = pc & ~mask(entry.getOffsetBits() + instShiftAmt);
+    Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
+    Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.getOffsetBits() + instShiftAmt));
 
     Addr targetLower = entry.targetOffset << instShiftAmt;
 
-    if (entry.usePagePointer) {
+    if (entry.isUsePagePointer()) {
         carry = pageEntry.carry;
         Addr pageOffset = (pageEntry.tag << floorLog2(numPageSets)) | entry.pagePointerSet;
         Addr pageSection = pageOffset << (maxOffsetBits + instShiftAmt);
@@ -302,7 +302,7 @@ Addr BTBPDede::getMonitorTag(Addr pc)
     unsigned fetchBlockWidth = floorLog2(predictWidth);
     unsigned setWidth = floorLog2(numSets);
     Addr fullTag = pc >> (fetchBlockWidth + setWidth);
-    // use folded xor for higher 8 bits
+    // use folded xor for higher tagFoldedBits bits
     Addr tagHigher = 0;
     Addr tagLower = fullTag & mask(tagBits - tagFoldedBits);
     for (unsigned i = 0; i < tagBits; i += tagFoldedBits) {
@@ -326,7 +326,7 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
         unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
         Addr alignedAddr = alignedStartAddr + blockSize * i;
         Addr idx = getMonitorIdx(alignedAddr);
-        auto monitorSet = monitorTable[phyBankIdx][idx];
+        MonitorSet monitorSet = monitorTable[phyBankIdx][idx];
         res.push_back(monitorSet);
     }
 
@@ -537,7 +537,7 @@ void BTBPDede::update(const FetchStream& stream) {
     monitorEntry.valid = true;
     monitorEntry.position = alignedPosition;
     monitorEntry.tag = getMonitorTag(exec.pc);
-    monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.offsetBits);
+    monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.getOffsetBits());
     if (usePagePointer && (targetDiffBits > maxOffsetBits)) {
         Addr pagePointerSet = getPageTableIdx(exec.pc);
         // check if page entry exists
@@ -588,7 +588,7 @@ void BTBPDede::update(const FetchStream& stream) {
         monitorEntry.carry = computeCarryBits(
             exec.pc,
             exec.target,
-            monitorEntry.offsetBits
+            monitorEntry.getOffsetBits()
         );
         monitorEntry.attr = execAttr;
     }

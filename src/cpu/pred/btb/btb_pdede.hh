@@ -82,6 +82,11 @@ private:
 
     struct MonitorEntry
     {
+    private:
+        // const attributes
+        int offsetBits;
+        bool usePagePointer;
+    public:
         bool valid;
         bool isCrossPage;
         unsigned position; // position in the fetch block
@@ -91,11 +96,11 @@ private:
         Addr pagePointerWay;
         TargetCarry carry;
         BranchAttribute attr;
-        // const attributes
-        const int offsetBits;
-        const bool usePagePointer;
         MonitorEntry(int offsetBits, bool usePagePointer)
             : offsetBits(offsetBits), usePagePointer(usePagePointer) {}
+
+        int getOffsetBits() const { return offsetBits; }
+        bool isUsePagePointer() const { return usePagePointer; }
     };
     typedef std::vector<MonitorEntry> MonitorSet;
     typedef std::vector<MonitorSet> MonitorAlignBank;
@@ -123,6 +128,8 @@ private:
 
     typedef std::vector<unsigned> ReplacementAlignBank;
 
+    std::shared_ptr<BTBPDedeMeta> meta;
+
     // register implementation
     std::vector<ReplacementAlignBank> monitorPLRUTable; // PLRU replacement table
     std::vector<unsigned> pagePLRUTable;    // page table PLRU replacement table
@@ -131,7 +138,6 @@ private:
 
     // sram implementation
     std::vector<MonitorAlignBank> monitorTable;
-    std::shared_ptr<BTBPDedeMeta> meta;
 
     unsigned getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx);
     Addr getFullTarget(Addr pc, const MonitorEntry &entry);
