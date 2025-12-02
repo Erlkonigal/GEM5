@@ -135,7 +135,7 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
 
     Addr targetLower = entry.targetOffset << instShiftAmt;
 
-    if (entry.isUsePagePointer()) {
+    if (entry.isUsePagePointer() && entry.isCrossPage) {
         carry = pageEntry.carry;
         Addr pageOffset = (pageEntry.tag << floorLog2(numPageSets)) | entry.pagePointerSet;
         Addr pageSection = pageOffset << (maxOffsetBits + instShiftAmt);
@@ -355,7 +355,8 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
     for (unsigned i = 0; i < numAlignBanks; ++i) {
         auto &bank = monitorEntries[i];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
-        for (auto &entry: bank) {
+        for (unsigned way = 0; way < numWays; ++way) {
+            auto &entry = bank[way];
             Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
             if (!entry.valid) continue;
             if (entry.tag != getMonitorTag(alignedAddr)) continue;
@@ -370,8 +371,39 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             btbEntry.isIndirect = (entry.attr.branchType == BranchAttribute::BranchTypeEnum::Indirect);
             btbEntry.isCall = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Push);
             btbEntry.isReturn = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Pop);
-            btbEntry.size = std::pow(2, instShiftAmt); // assume size is 2^instShiftAmt
+            btbEntry.size = 1 << instShiftAmt; // assume size is 2^instShiftAmt
             btbEntries.push_back(btbEntry);
+            DPRINTF(BTBPDede, "BTBPDede: found valid BTB entry pc %#lx target %#lx\n",
+                btbEntry.pc, btbEntry.target);
+            DPRINTF(BTBPDede, "BTBPDede: entry details - isCond %d, isIndirect %d, isCall %d, isReturn %d\n",
+                btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn);
+
+            // update entry LRU state
+            unsigned alignedBankIdx = getRotatedAlignBankIdx(alignedAddr, i);
+            Addr monitorIdx = getMonitorIdx(alignedAddr);
+            unsigned currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
+            unsigned updatedPLRUState = getUpdatedPLRUState(
+                currentPLRUState,
+                numWays,
+                way
+            );
+            monitorPLRUTable[alignedBankIdx][monitorIdx] = updatedPLRUState;
+            DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
+                alignedBankIdx, monitorIdx, currentPLRUState, updatedPLRUState);
+
+            // update page table LRU state if using page pointer
+            if (entry.isUsePagePointer() && entry.isCrossPage) {
+                Addr pageTableIdx = getPageTableIdx(alignedAddr);
+                unsigned currentPagePLRUState = pagePLRUTable[pageTableIdx];
+                unsigned updatedPagePLRUState = getUpdatedPLRUState(
+                    currentPagePLRUState,
+                    numPageWays,
+                    entry.pagePointerWay
+                );
+                pagePLRUTable[pageTableIdx] = updatedPagePLRUState;
+                DPRINTF(BTBPDede, "BTBPDede: updated page table PLRU state for idx %#lx from %#x to %#x\n",
+                    pageTableIdx, currentPagePLRUState, updatedPagePLRUState);
+            }
         }
     }
 
@@ -421,6 +453,8 @@ void BTBPDede::putPCHistory(
     std::vector<FullBTBPrediction> &stagePreds
 )
 {
+    DPRINTF(BTBPDede, "===== BTBPDede: putPCHistory called for startAddr %#lx =====\n", startAddr);
+
     meta = std::make_shared<BTBPDedeMeta>();
     // Lookup monitor entries
     auto monitorEntries = getMonitorEntries(startAddr);
@@ -444,6 +478,9 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPD
     Addr pc = exec.pc;
     Addr target = exec.target;
     bool isReturn = exec.isReturn;
+
+    DPRINTF(BTBPDede, "BTBPDede: getPartitionIdx called for pc %#lx target %#lx isReturn %d\n",
+        pc, target, isReturn);
 
     Addr alignedPC = pc & ~(blockSize - 1);
     unsigned alignBankIdx = getRotatedAlignBankIdx(pc, 0);
@@ -470,13 +507,18 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPD
             break;
         }
     }
-
+    DPRINTF(BTBPDede, "BTBPDede: getPartitionIdx computed diffBits %d startIdx %d\n",
+        diffBits, startIdx);
     /* if !foundEmpty, we use PLRU to choose the way;
      * NOTE: in this case, PLRU will give numWay victims,
      *       so we need to filter the ways that are smaller than startIdx,
      *       and choose the first one among the rest.
      */
-    if (foundEmpty) return finalIdx;
+    if (foundEmpty) {
+        DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (empty) for pc %#lx\n",
+            finalIdx, pc);
+        return finalIdx;
+    }
 
     auto monitorIdx = getMonitorIdx(alignedPC);
     auto plruState = monitorPLRUTable[alignBankIdx][monitorIdx];
@@ -487,13 +529,26 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPD
             break;
         }
     }
+    for (auto way : plruVictims) {
+        DPRINTF(BTBPDede, "BTBPDede: PLRU victim way %d\n", way);
+    }
+    DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (PLRU) for pc %#lx\n",
+        finalIdx, pc);
 
     return finalIdx;
 }
 
 void BTBPDede::update(const FetchStream& stream) {
-    if (stream.squashType != SQUASH_CTRL) return;
-    if (!stream.exeTaken) return;
+    DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
+
+    if (stream.squashType != SQUASH_CTRL) {
+        DPRINTF(BTBPDede, "BTBPDede: update skipped due to non-control squash\n");
+        return;
+    }
+    if (!stream.exeTaken) {
+        DPRINTF(BTBPDede, "BTBPDede: update skipped due to not taken branch\n");
+        return;
+    }
 
     auto metaFromUpdate =
         std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
@@ -539,6 +594,8 @@ void BTBPDede::update(const FetchStream& stream) {
     monitorEntry.tag = getMonitorTag(exec.pc);
     monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.getOffsetBits());
     if (usePagePointer && (targetDiffBits > maxOffsetBits)) {
+        DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update\n");
+
         Addr pagePointerSet = getPageTableIdx(exec.pc);
         // check if page entry exists
         Addr pagePointerWay = 0;
@@ -557,9 +614,11 @@ void BTBPDede::update(const FetchStream& stream) {
         monitorEntry.isCrossPage = true;
         monitorEntry.pagePointerSet = pagePointerSet;
         if (pageEntryExists) {
+            DPRINTF(BTBPDede, "BTBPDede: page entry exists in way %d\n", pagePointerWay);
             monitorEntry.pagePointerWay = pagePointerWay;
         }
         else {
+            DPRINTF(BTBPDede, "BTBPDede: page entry does not exist, allocating new entry\n");
             // choose victim way using PLRU
             auto plruState = pagePLRUTable[pagePointerSet];
             auto plruVictims = getPLRUVictims(plruState, numPageWays);
@@ -567,6 +626,8 @@ void BTBPDede::update(const FetchStream& stream) {
             monitorEntry.pagePointerWay = pagePointerWay;
 
             // update page entry
+            DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
+                pagePointerSet, pagePointerWay);
             auto &pageEntry = pageTable[pagePointerSet][pagePointerWay];
             pageEntry.tag = getPageTableTag(exec.pc);
             pageEntry.carry = computeCarryBits(
@@ -574,7 +635,8 @@ void BTBPDede::update(const FetchStream& stream) {
                 exec.target,
                 maxOffsetBits + pageBits
             );
-
+            DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
+            printPageEntry(pageEntry);
             // update page PLRU state
             unsigned updatedPLRUState = getUpdatedPLRUState(
                 pagePLRUTable[pagePointerSet],
@@ -585,6 +647,7 @@ void BTBPDede::update(const FetchStream& stream) {
         }
     }
     else {
+        DPRINTF(BTBPDede, "BTBPDede: not using page pointer for monitor entry update\n");
         monitorEntry.carry = computeCarryBits(
             exec.pc,
             exec.target,
@@ -592,6 +655,13 @@ void BTBPDede::update(const FetchStream& stream) {
         );
         monitorEntry.attr = execAttr;
     }
+
+
+    DPRINTF(BTBPDede, "BTBPDede: updated monitor entry at bank %d, index %d, way %d\n",
+        alignedBankIdx, monitorIdx, partitionIdx);
+
+    DPRINTF(BTBPDede, "BTBPDede: updated monitor entry details:\n");
+    printMonitorEntry(monitorEntry);
 
 }
 
@@ -610,6 +680,20 @@ void BTBPDede::dumpBTBEntries(const std::vector<BTBEntry>& es) {
     }
 }
 
+void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
+    DPRINTF(BTBPDede, "MonitorEntry: offsetBits:%d, usePagePointer:%d, valid:%d, isCrossPage:%d, "
+        "position:%d, tag:%#lx, targetOffset:%#lx, pagePointerSet:%#lx, "
+        "pagePointerWay:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
+        e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
+        e.position, e.tag, e.targetOffset, e.pagePointerSet,
+        e.pagePointerWay, e.carry.targetCarry,
+        e.attr.branchType, e.attr.rasAction);
+}
+
+void BTBPDede::printPageEntry(const PageEntry& e) {
+    DPRINTF(BTBPDede, "PageEntry: tag:%#lx, ctr:%d, carry:%d\n",
+        e.tag, e.ctr, e.carry.targetCarry);
+}
 
 }
 }

@@ -165,6 +165,9 @@ private:
     void printBTBEntry(const BTBEntry& e);
     void dumpBTBEntries(const std::vector<BTBEntry>& es);
 
+    void printMonitorEntry(const MonitorEntry& e);
+    void printPageEntry(const PageEntry& e);
+
 public:
     BTBPDede(const Params& p);
     ~BTBPDede() override;

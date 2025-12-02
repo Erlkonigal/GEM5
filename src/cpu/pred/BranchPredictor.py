@@ -1196,7 +1196,7 @@ class BTBPDede(TimedBaseBTBPredictor):
     pageBits = Param.Unsigned(16, "Number of bits for page offset")
     instShiftAmt = Param.Unsigned(1, "Amount to shift PC to get inst bits")
     numThreads = Param.Unsigned(1, "Number of threads")
-    numWays = Param.Unsigned(8, "Number of ways per set")
+    numWays = Param.Unsigned(4, "Number of ways per set")
     numPageWays = Param.Unsigned(8, "Number of ways per set in Page Table")
     numRegionWays = Param.Unsigned(1, "Number of ways per set in Region Table")
     numDelay = 2
