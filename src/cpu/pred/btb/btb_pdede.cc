@@ -33,10 +33,12 @@ BTBPDede::BTBPDede(const Params& p):
             for way 6 to way 7, offset bits are 11, with PagePointer
 
         Page table:
-            2 align banks use the same page table, totally 128 entries
-            each entry has 8 ways, 16 entries per way
-            each entry in a way has pageBits - log2(numPageSets) bits of tag
-            we use Cat(tag, pagePointer_set) to get the full page offset
+            2 align banks use the same page table, totally 512 entries
+            each entry has 16 ways, 32 entries per way
+            each entry in a way has pageBits bits of tag
+            we use targetOffset bits [11:7] to index the page table
+            if cross-page, we use Cat(pcHigher, pageTag, targetOffset, 0.B(instShiftAmt)) to form the full target
+            otherwise, we use Cat(pcHigher, pagePointerWway, targetOffset, 0.B(instShiftAmt)) to form the full target
 
         We choose Solution 1 when numWays == 4, Solution 2 when numWays == 8
     */
@@ -148,6 +150,26 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
         }
         else {
             fullTarget = pcUpperMinusOne | pageSection | targetLower;
+        }
+    }
+    else if (entry.isUsePagePointer()) {
+        carry = entry.carry;
+
+        // we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
+        pcMiddle = pc & ~mask(floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt);
+        pcMiddlePlusOne = pcMiddle + (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
+        pcMiddleMinusOne = pcMiddle - (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
+
+        Addr pageSection = entry.pagePointerWay << (maxOffsetBits + instShiftAmt);
+
+        if (carry.isFit()) {
+            fullTarget = pcMiddle | pageSection | targetLower;
+        }
+        else if (carry.isPlusOne()) {
+            fullTarget = pcMiddlePlusOne | pageSection | targetLower;
+        }
+        else {
+            fullTarget = pcMiddleMinusOne | pageSection | targetLower;
         }
     }
     else {
@@ -647,6 +669,19 @@ void BTBPDede::update(const FetchStream& stream) {
             );
             pagePLRUTable[pagePointerSet] = updatedPLRUState;
         }
+    }
+    else if (usePagePointer && (targetDiffBits <= maxOffsetBits)) {
+        DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update (not cross page)\n");
+
+        monitorEntry.isCrossPage = false;
+        monitorEntry.pagePointerWay = (exec.target >> (maxOffsetBits + instShiftAmt)) & mask(floorLog2(numPageWays));
+
+        monitorEntry.carry = computeCarryBits(
+            exec.pc,
+            exec.target,
+            maxOffsetBits + floorLog2(numPageWays)
+        );
+        monitorEntry.attr = execAttr;
     }
     else {
         DPRINTF(BTBPDede, "BTBPDede: not using page pointer for monitor entry update\n");
