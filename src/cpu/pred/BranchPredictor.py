@@ -984,7 +984,9 @@ class MBTB(TimedBaseBTBPredictor):
     numDelay = 2
     blockSize = 32  # max 64 byte block, 32 byte aligned
     # MBTB is always half-aligned - no parameter needed
-    victimCacheSize = Param.Unsigned(0, "Number of entries in the victim cache")
+    victimCacheSize = Param.Unsigned(16, "Number of entries in the victim cache")
+    # MBTB disabled when BTBPDede is enabled
+    enabled = False
 
 class AheadBTB(TimedBaseBTBPredictor):
     type = 'AheadBTB'
@@ -1218,6 +1220,7 @@ class DecoupledBPUWithBTB(BranchPredictor):
     abtb = Param.AheadBTB(AheadBTB(), "ABTB predictor")
     microtage = Param.MicroTAGE(MicroTAGE(), "MicroTAGE predictor to assist uBTB")
     mbtb = Param.MBTB(MBTB(), "MBTB predictor")
+    pdede = Param.BTBPDede(BTBPDede(), "BTBPDede predictor")
     tage = Param.BTBTAGE(BTBTAGE(), "TAGE predictor")
     ittage = Param.BTBITTAGE(BTBITTAGE(), "ITTAGE predictor")
     mgsc = Param.BTBMGSC(BTBMGSC(), "MGSC predictor")

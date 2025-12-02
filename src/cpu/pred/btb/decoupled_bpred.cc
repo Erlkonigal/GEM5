@@ -37,6 +37,7 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       ubtb(p.ubtb),
       abtb(p.abtb),
       mbtb(p.mbtb),
+      pdede(p.pdede),
       microtage(p.microtage),
       tage(p.tage),
       ittage(p.ittage),
@@ -59,10 +60,16 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     if (abtb->isEnabled()) components.push_back(abtb);
     if (microtage->isEnabled()) components.push_back(microtage);
     if (mbtb->isEnabled()) components.push_back(mbtb);
+    if (pdede->isEnabled()) components.push_back(pdede);
     if (tage->isEnabled()) components.push_back(tage);
     if (ras->isEnabled()) components.push_back(ras);
     if (ittage->isEnabled()) components.push_back(ittage);
     if (mgsc->isEnabled()) components.push_back(mgsc);
+
+    if (mbtb->isEnabled() && pdede->isEnabled()) {
+        fatal("MBTB and BTBPDede cannot be both enabled\n");
+    }
+
     numComponents = components.size();
     for (int i = 0; i < numComponents; i++) {
         components[i]->setComponentIdx(i);
