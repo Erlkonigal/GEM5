@@ -35,7 +35,7 @@ BTBPDede::BTBPDede(const Params& p):
         Page table:
             2 align banks use the same page table, totally 128 entries
             each entry has 8 ways, 16 entries per way
-            each entry in a way has pageBits - log2(numPageWays) bits of tag
+            each entry in a way has pageBits - log2(numPageSets) bits of tag
             we use Cat(tag, pagePointer_set) to get the full page offset
 
         We choose Solution 1 when numWays == 4, Solution 2 when numWays == 8
