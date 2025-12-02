@@ -723,13 +723,13 @@ void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
         "pagePointerWay:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
         e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
         e.position, e.tag, e.targetOffset, getPageTableIdx(e.targetOffset << instShiftAmt),
-        e.pagePointerWay, e.carry.targetCarry,
-        e.attr.branchType, e.attr.rasAction);
+        e.pagePointerWay, (int)e.carry.targetCarry,
+        (int)e.attr.branchType, (int)e.attr.rasAction);
 }
 
 void BTBPDede::printPageEntry(const PageEntry& e) {
     DPRINTF(BTBPDede, "PageEntry: tag:%#lx, ctr:%d, carry:%d\n",
-        e.tag, e.ctr, e.carry.targetCarry);
+        e.tag, e.ctr, (int)e.carry.targetCarry);
 }
 
 }
