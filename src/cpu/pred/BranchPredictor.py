@@ -1189,7 +1189,7 @@ class BTBPDede(TimedBaseBTBPredictor):
     cxx_header = "cpu/pred/btb/btb_pdede.hh"
 
     numEntries = Param.Unsigned(8192, "Number of entries in the MonitorBTB")
-    numPageEntries = Param.Unsigned(128, "Number of entries in the Page Table")
+    numPageEntries = Param.Unsigned(512, "Number of entries in the Page Table")
     numRegionEntries = Param.Unsigned(4, "Number of entries in the Region Table")
     tagBits = Param.Unsigned(20, "Number of bits in the tag")
     tagFoldedBits = Param.Unsigned(8, "Number of folded tag bits for indexing")
@@ -1197,7 +1197,7 @@ class BTBPDede(TimedBaseBTBPredictor):
     instShiftAmt = Param.Unsigned(1, "Amount to shift PC to get inst bits")
     numThreads = Param.Unsigned(1, "Number of threads")
     numWays = Param.Unsigned(4, "Number of ways per set")
-    numPageWays = Param.Unsigned(8, "Number of ways per set in Page Table")
+    numPageWays = Param.Unsigned(16, "Number of ways per set in Page Table")
     numRegionWays = Param.Unsigned(1, "Number of ways per set in Region Table")
     numDelay = 2
     blockSize = 32  # max 64 byte block, 32 byte aligned

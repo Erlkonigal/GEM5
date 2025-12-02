@@ -23,8 +23,8 @@ BTBPDede::BTBPDede(const Params& p):
             // Solution 1
             each bank has 4096 entries
             each entry has 4 ways, 1024 entries per way
-            for way 0 to way 2, offset bits are 4, 7, 11
-            for way 3, offset bits are 11, with PagePointer
+            for way 0 to way 1, offset bits are 11, 11,
+            for way 2 to way 3, offset bits are 11, with PagePointer
 
             // Solution 2
             each bank has 4096 entries
@@ -119,8 +119,10 @@ unsigned BTBPDede::getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx)
 
 Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
 {
+    Addr targetLower = entry.targetOffset << instShiftAmt;
+
     const auto &pageEntry =
-        pageTable[entry.pagePointerSet][entry.pagePointerWay];
+        pageTable[getPageTableIdx(targetLower)][entry.pagePointerWay];
 
     Addr fullTarget = 0;
     TargetCarry carry = {TargetCarry::TargetCarryEnum::Fit};
@@ -133,12 +135,10 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
     Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.getOffsetBits() + instShiftAmt));
 
-    Addr targetLower = entry.targetOffset << instShiftAmt;
 
     if (entry.isUsePagePointer() && entry.isCrossPage) {
         carry = pageEntry.carry;
-        Addr pageOffset = (pageEntry.tag << floorLog2(numPageSets)) | entry.pagePointerSet;
-        Addr pageSection = pageOffset << (maxOffsetBits + instShiftAmt);
+        Addr pageSection = pageEntry.tag << (maxOffsetBits + instShiftAmt);
 
         if (carry.isFit()) {
             fullTarget = pcUpper | pageSection | targetLower;
@@ -336,14 +336,17 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
 }
 
 Addr BTBPDede::getPageTableIdx(Addr pc) {
-    Addr idx = (pc >> (maxOffsetBits + instShiftAmt)) & (numPageSets - 1);
+    // select high floorLog2(numPageSets) bits from targetOffset
+    // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
+    // then we select bits [11:11-5+1] = bits [11:7] from targetOffset
+    unsigned setWidth = floorLog2(numPageSets);
+    Addr idx = (pc >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
     return idx;
 }
 
 Addr BTBPDede::getPageTableTag(Addr pc) {
-    unsigned setWidth = floorLog2(numPageSets);
-    Addr fullTag = pc >> (maxOffsetBits + instShiftAmt + setWidth);
-    return fullTag & mask(pageBits - setWidth);
+    Addr fullTag = pc >> (maxOffsetBits + instShiftAmt);
+    return fullTag & mask(pageBits);
 }
 
 std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector<MonitorSet> &originEntries)
@@ -612,7 +615,6 @@ void BTBPDede::update(const FetchStream& stream) {
         }
 
         monitorEntry.isCrossPage = true;
-        monitorEntry.pagePointerSet = pagePointerSet;
         if (pageEntryExists) {
             DPRINTF(BTBPDede, "BTBPDede: page entry exists in way %d\n", pagePointerWay);
             monitorEntry.pagePointerWay = pagePointerWay;
@@ -685,7 +687,7 @@ void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
         "position:%d, tag:%#lx, targetOffset:%#lx, pagePointerSet:%#lx, "
         "pagePointerWay:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
         e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
-        e.position, e.tag, e.targetOffset, e.pagePointerSet,
+        e.position, e.tag, e.targetOffset, getPageTableIdx(e.targetOffset << instShiftAmt),
         e.pagePointerWay, e.carry.targetCarry,
         e.attr.branchType, e.attr.rasAction);
 }
