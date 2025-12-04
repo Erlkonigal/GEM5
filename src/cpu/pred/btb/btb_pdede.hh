@@ -66,7 +66,7 @@ private:
     {
         enum class TargetCarryEnum
         {
-            Fit, PlusOne, MinusOne
+            Fit, PlusOne, MinusOne, None
         } targetCarry;
 
         bool isFit() const {
@@ -97,7 +97,7 @@ private:
         TargetCarry carry;
         BranchAttribute attr;
         MonitorEntry(int offsetBits, bool usePagePointer)
-            : offsetBits(offsetBits), usePagePointer(usePagePointer) {}
+            : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false) {}
 
         int getOffsetBits() const { return offsetBits; }
         bool isUsePagePointer() const { return usePagePointer; }
@@ -107,7 +107,6 @@ private:
 
     struct PageEntry
     {
-        TargetCarry carry;
         Addr tag;
         int ctr;
     };
@@ -115,7 +114,6 @@ private:
 
     struct RegionEntry
     {
-        TargetCarry carry;
         Addr tag;
         int ctr;
     };
@@ -144,7 +142,8 @@ private:
     TargetCarry computeCarryBits(Addr pc, Addr target, unsigned offsetBits);
 
     std::vector<unsigned> getPLRUVictims(unsigned state, unsigned numWays);
-    unsigned getUpdatedPLRUState(unsigned state, unsigned numWays, unsigned touchWay);
+    unsigned getTouchedPLRUState(unsigned state, unsigned numWays, unsigned touchWay);
+    unsigned getMakeVictimPLRUState(unsigned state, unsigned numWays, unsigned victimWay);
 
     Addr getMonitorIdx(Addr pc);
     Addr getMonitorTag(Addr pc);
@@ -160,7 +159,7 @@ private:
     );
 
     unsigned getTargetDiffBits(Addr pc, Addr target);
-    unsigned getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPDedeMeta> meta);
+    unsigned getPartitionIdx(const BranchInfo &exec, const std::shared_ptr<BTBPDedeMeta> &meta);
 
     void printBTBEntry(const BTBEntry& e);
     void dumpBTBEntries(const std::vector<BTBEntry>& es);

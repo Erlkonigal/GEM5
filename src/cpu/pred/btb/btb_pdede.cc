@@ -127,7 +127,7 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
         pageTable[getPageTableIdx(targetLower)][entry.pagePointerWay];
 
     Addr fullTarget = 0;
-    TargetCarry carry = {TargetCarry::TargetCarryEnum::Fit};
+    TargetCarry carry = entry.carry;
 
     Addr pcUpper = pc & ~mask(pageBits + maxOffsetBits + instShiftAmt);
     Addr pcUpperPlusOne = pcUpper + (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
@@ -137,9 +137,7 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
     Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.getOffsetBits() + instShiftAmt));
 
-
     if (entry.isUsePagePointer() && entry.isCrossPage) {
-        carry = pageEntry.carry;
         Addr pageSection = pageEntry.tag << (maxOffsetBits + instShiftAmt);
 
         if (carry.isFit()) {
@@ -148,13 +146,14 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
         else if (carry.isPlusOne()) {
             fullTarget = pcUpperPlusOne | pageSection | targetLower;
         }
-        else {
+        else if (carry.isMinusOne()){
             fullTarget = pcUpperMinusOne | pageSection | targetLower;
+        }
+        else {
+            fullTarget = targetLower; // invalid target
         }
     }
     else if (entry.isUsePagePointer()) {
-        carry = entry.carry;
-
         // we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
         pcMiddle = pc & ~mask(floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt);
         pcMiddlePlusOne = pcMiddle + (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
@@ -168,21 +167,25 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
         else if (carry.isPlusOne()) {
             fullTarget = pcMiddlePlusOne | pageSection | targetLower;
         }
-        else {
+        else if (carry.isMinusOne()){
             fullTarget = pcMiddleMinusOne | pageSection | targetLower;
+        }
+        else {
+            fullTarget = targetLower; // invalid target
         }
     }
     else {
-        carry = entry.carry;
-
         if (carry.isFit()) {
             fullTarget = pcMiddle | targetLower;
         }
         else if (carry.isPlusOne()) {
             fullTarget = pcMiddlePlusOne | targetLower;
         }
-        else {
+        else if (carry.isMinusOne()){
             fullTarget = pcMiddleMinusOne | targetLower;
+        }
+        else {
+            fullTarget = targetLower; // invalid target
         }
     }
 
@@ -208,8 +211,11 @@ BTBPDede::TargetCarry BTBPDede::computeCarryBits(Addr pc, Addr target, unsigned 
     else if (candidatePlusOne == target) {
         carry.targetCarry = TargetCarry::TargetCarryEnum::PlusOne;
     }
-    else {
+    else if (candidateMinusOne == target) {
         carry.targetCarry = TargetCarry::TargetCarryEnum::MinusOne;
+    }
+    else {
+        carry.targetCarry = TargetCarry::TargetCarryEnum::None;
     }
 
     return carry;
@@ -226,7 +232,7 @@ std::vector<unsigned> BTBPDede::getPLRUVictims(unsigned state, unsigned numWays)
 {
     assert(isPowerOf2(numWays));
 
-    std::vector<unsigned> ways(numWays);
+    std::vector<unsigned> ways;
 
     if (numWays > 2) {
         unsigned rightWays = numWays / 2;
@@ -268,10 +274,10 @@ std::vector<unsigned> BTBPDede::getPLRUVictims(unsigned state, unsigned numWays)
     return ways;
 }
 
-unsigned BTBPDede::getUpdatedPLRUState(unsigned state, unsigned numWays, unsigned touchWay) {
+unsigned BTBPDede::getTouchedPLRUState(unsigned state, unsigned numWays, unsigned touchWay) {
     assert(isPowerOf2(numWays));
 
-    unsigned updatedState = 0;
+    unsigned touchedState = 0;
 
     if (numWays > 2) {
         unsigned rightWays = numWays / 2;
@@ -281,35 +287,78 @@ unsigned BTBPDede::getUpdatedPLRUState(unsigned state, unsigned numWays, unsigne
         unsigned rightSubtreeState = state & mask(rightWays - 1);
 
         if (setLeftOlder) {
-            unsigned updatedRightState = getUpdatedPLRUState(
+            unsigned touchedRightState = getTouchedPLRUState(
                 rightSubtreeState,
                 rightWays,
                 touchWay & mask(floorLog2(rightWays))
             );
-            updatedState |= (1 << (numWays - 2)); // set left older bit
-            updatedState |= leftSubtreeState << (rightWays - 1);
-            updatedState |= updatedRightState;
+            touchedState |= (1 << (numWays - 2)); // set left older bit
+            touchedState |= leftSubtreeState << (rightWays - 1);
+            touchedState |= touchedRightState;
         }
         else {
-            unsigned updatedLeftState = getUpdatedPLRUState(
+            unsigned touchedLeftState = getTouchedPLRUState(
                 leftSubtreeState,
                 leftWays,
                 touchWay & mask(floorLog2(leftWays))
             );
-            updatedState &= ~(1 << (numWays - 2)); // clear left older bit
-            updatedState |= updatedLeftState << (rightWays - 1);
-            updatedState |= rightSubtreeState;
+            touchedState &= ~(1 << (numWays - 2)); // clear left older bit
+            touchedState |= touchedLeftState << (rightWays - 1);
+            touchedState |= rightSubtreeState;
         }
 
     }
     else if (numWays == 2) {
-        updatedState = !(touchWay & 0x1);
+        touchedState = !(touchWay & 0x1);
     }
     else {
         assert(false); // should not reach here
     }
 
-    return updatedState;
+    return touchedState;
+}
+
+unsigned BTBPDede::getMakeVictimPLRUState(unsigned state, unsigned numWays, unsigned victimWay) {
+    assert(isPowerOf2(numWays));
+
+    unsigned victimizedState = 0;
+
+    if (numWays > 2) {
+        unsigned rightWays = numWays / 2;
+        unsigned leftWays = numWays - rightWays;
+        unsigned setLeftOlder = (victimWay >> (floorLog2(numWays) - 1)) & 0x1;
+        unsigned leftSubtreeState = (state >> (rightWays - 1)) & mask(leftWays - 1);
+        unsigned rightSubtreeState = state & mask(rightWays - 1);
+
+        if (setLeftOlder) {
+            unsigned victimizedLeftState = getMakeVictimPLRUState(
+                leftSubtreeState,
+                leftWays,
+                victimWay & mask(floorLog2(leftWays))
+            );
+            victimizedState |= (1 << (numWays - 2)); // set left older bit
+            victimizedState |= victimizedLeftState << (rightWays - 1);
+            victimizedState |= rightSubtreeState;
+        }
+        else {
+            unsigned victimizedRightState = getMakeVictimPLRUState(
+                rightSubtreeState,
+                rightWays,
+                victimWay & mask(floorLog2(rightWays))
+            );
+            victimizedState &= ~(1 << (numWays - 2)); // clear left older bit
+            victimizedState |= leftSubtreeState << (rightWays - 1);
+            victimizedState |= victimizedRightState;
+        }
+    }
+    else if (numWays == 2) {
+        victimizedState = (victimWay & 0x1);
+    }
+    else {
+        assert(false); // should not reach here
+    }
+
+    return victimizedState;
 }
 
 Addr BTBPDede::getMonitorIdx(Addr pc)
@@ -339,7 +388,7 @@ Addr BTBPDede::getMonitorTag(Addr pc)
 
 std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
 {
-    std::vector<MonitorSet> res;
+    std::vector<MonitorSet> res(numAlignBanks);
 
     unsigned alignBankWidth = floorLog2(blockSize);
     Addr alignedStartAddr = pc & ~(blockSize - 1);
@@ -349,7 +398,7 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
         Addr alignedAddr = alignedStartAddr + blockSize * i;
         Addr idx = getMonitorIdx(alignedAddr);
         MonitorSet monitorSet = monitorTable[phyBankIdx][idx];
-        res.push_back(monitorSet);
+        res[phyBankIdx] = monitorSet;
     }
 
     meta->rawMonitorSets = res;
@@ -378,7 +427,8 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
 
     // collect all valid entries
     for (unsigned i = 0; i < numAlignBanks; ++i) {
-        auto &bank = monitorEntries[i];
+        unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
+        auto &bank = monitorEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
         for (unsigned way = 0; way < numWays; ++way) {
             auto &entry = bank[way];
@@ -407,31 +457,35 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             unsigned alignedBankIdx = getRotatedAlignBankIdx(alignedAddr, i);
             Addr monitorIdx = getMonitorIdx(alignedAddr);
             unsigned currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
-            unsigned updatedPLRUState = getUpdatedPLRUState(
+            unsigned touchedPLRUState = getTouchedPLRUState(
                 currentPLRUState,
                 numWays,
                 way
             );
-            monitorPLRUTable[alignedBankIdx][monitorIdx] = updatedPLRUState;
-            DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
-                alignedBankIdx, monitorIdx, currentPLRUState, updatedPLRUState);
+            monitorPLRUTable[alignedBankIdx][monitorIdx] = touchedPLRUState;
+            DPRINTF(BTBPDede, "BTBPDede: touched monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
+                alignedBankIdx, monitorIdx, currentPLRUState, touchedPLRUState);
 
             // update page table LRU state if using page pointer
             if (entry.isUsePagePointer() && entry.isCrossPage) {
                 Addr pageTableIdx = getPageTableIdx(alignedAddr);
                 unsigned currentPagePLRUState = pagePLRUTable[pageTableIdx];
-                unsigned updatedPagePLRUState = getUpdatedPLRUState(
+                unsigned touchedPagePLRUState = getTouchedPLRUState(
                     currentPagePLRUState,
                     numPageWays,
                     entry.pagePointerWay
                 );
-                pagePLRUTable[pageTableIdx] = updatedPagePLRUState;
-                DPRINTF(BTBPDede, "BTBPDede: updated page table PLRU state for idx %#lx from %#x to %#x\n",
-                    pageTableIdx, currentPagePLRUState, updatedPagePLRUState);
+                pagePLRUTable[pageTableIdx] = touchedPagePLRUState;
+                DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
+                    pageTableIdx, currentPagePLRUState, touchedPagePLRUState);
             }
         }
     }
-
+    std::sort(btbEntries.begin(), btbEntries.end(),
+        [](const BTBEntry &a, const BTBEntry &b) {
+            return a.pc < b.pc;
+        }
+    );
     return btbEntries;
 }
 
@@ -499,7 +553,7 @@ unsigned BTBPDede::getTargetDiffBits(Addr pc, Addr target) {
     return diffBits;
 }
 
-unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPDedeMeta> meta) {
+unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const std::shared_ptr<BTBPDedeMeta> &meta) {
     Addr pc = exec.pc;
     Addr target = exec.target;
     bool isReturn = exec.isReturn;
@@ -513,6 +567,9 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPD
     auto getSmallestPartitionIdx = [this](unsigned diffBits) -> unsigned {
         for (unsigned i = 0; i < wayOffsetBits.size(); ++i) {
             if (diffBits <= wayOffsetBits[i]) {
+                return i;
+            }
+            else if (wayUsePagePointer[i]) {
                 return i;
             }
         }
@@ -564,6 +621,8 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, std::shared_ptr<BTBPD
 }
 
 void BTBPDede::update(const FetchStream& stream) {
+    static uint64_t lastUpdateTick;
+
     DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
 
     if (stream.squashType != SQUASH_CTRL) {
@@ -575,6 +634,13 @@ void BTBPDede::update(const FetchStream& stream) {
         return;
     }
 
+    if (lastUpdateTick == stream.predTick) {
+        DPRINTF(BTBPDede, "BTBPDede: update skipped due to already updated in this prediction tick\n");
+        return;
+    }
+
+    lastUpdateTick = stream.predTick;
+
     auto metaFromUpdate =
         std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
 
@@ -582,6 +648,8 @@ void BTBPDede::update(const FetchStream& stream) {
     unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
     unsigned monitorIdx = getMonitorIdx(exec.pc);
     unsigned alignedPosition = (exec.pc & (blockSize - 1)) >> instShiftAmt;
+
+    MonitorSet toUpdate = metaFromUpdate->rawMonitorSets[alignedBankIdx];
 
     BranchAttribute execAttr({
         exec.isCond ? BranchAttribute::BranchTypeEnum::Conditional :
@@ -610,15 +678,45 @@ void BTBPDede::update(const FetchStream& stream) {
     unsigned targetDiffBits = getTargetDiffBits(exec.pc, exec.target);
     unsigned partitionIdx = getPartitionIdx(exec, metaFromUpdate);
     bool usePagePointer = wayUsePagePointer[partitionIdx];
-    MonitorEntry &monitorEntry =
-        monitorTable[alignedBankIdx][monitorIdx][partitionIdx];
+
+    // find entry already hit in monitor table
+    unsigned foundWay = -1;
+    for (unsigned way = 0; way < numWays; ++way) {
+        auto &entry = toUpdate[way];
+        if (!entry.valid) continue; // skip invalid entries
+        if (entry.position != alignedPosition) continue; // skip different position
+        if (entry.tag != getMonitorTag(exec.pc)) continue; // skip different tag
+        foundWay = way;
+        break;
+    }
+
+    if (foundWay != -1 && foundWay != partitionIdx) {
+        DPRINTF(BTBPDede, "BTBPDede: found existing monitor entry in way %d, need to invalid\n",
+            foundWay);
+        // invalidate the found entry
+        toUpdate[foundWay].valid = false;
+        // update PLRU state
+        // foundWay should be replaced as soon as possible
+        // so we set it as the most recently used entry
+        auto currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
+        auto newPLRUState = getMakeVictimPLRUState(
+            currentPLRUState,
+            numWays,
+            foundWay
+        );
+        monitorPLRUTable[alignedBankIdx][monitorIdx] = newPLRUState;
+        DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
+            alignedBankIdx, monitorIdx, currentPLRUState, newPLRUState);
+    }
+
+    MonitorEntry &monitorEntry = toUpdate[partitionIdx];
 
     // Update monitor entry
     monitorEntry.valid = true;
     monitorEntry.position = alignedPosition;
     monitorEntry.tag = getMonitorTag(exec.pc);
     monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.getOffsetBits());
-    if (usePagePointer && (targetDiffBits > maxOffsetBits)) {
+    if (usePagePointer && (targetDiffBits > maxOffsetBits + floorLog2(numPageWays))) {
         DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update\n");
 
         Addr pagePointerSet = getPageTableIdx(exec.pc);
@@ -654,23 +752,29 @@ void BTBPDede::update(const FetchStream& stream) {
                 pagePointerSet, pagePointerWay);
             auto &pageEntry = pageTable[pagePointerSet][pagePointerWay];
             pageEntry.tag = getPageTableTag(exec.pc);
-            pageEntry.carry = computeCarryBits(
+            DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
+            printPageEntry(pageEntry);
+
+            // update monitor entry carry bits
+            monitorEntry.carry = computeCarryBits(
                 exec.pc,
                 exec.target,
                 maxOffsetBits + pageBits
             );
-            DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
-            printPageEntry(pageEntry);
-            // update page PLRU state
-            unsigned updatedPLRUState = getUpdatedPLRUState(
-                pagePLRUTable[pagePointerSet],
-                numPageWays,
-                pagePointerWay
-            );
-            pagePLRUTable[pagePointerSet] = updatedPLRUState;
         }
+
+        // update page PLRU state
+        unsigned currentPLRUState = pagePLRUTable[pagePointerSet];
+        unsigned touchedPLRUState = getTouchedPLRUState(
+            currentPLRUState,
+            numPageWays,
+            pagePointerWay
+        );
+        pagePLRUTable[pagePointerSet] = touchedPLRUState;
+        DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
+            pagePointerSet, currentPLRUState, touchedPLRUState);
     }
-    else if (usePagePointer && (targetDiffBits <= maxOffsetBits)) {
+    else if (usePagePointer && (targetDiffBits <= maxOffsetBits + floorLog2(numPageWays))) {
         DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update (not cross page)\n");
 
         monitorEntry.isCrossPage = false;
@@ -693,13 +797,24 @@ void BTBPDede::update(const FetchStream& stream) {
         monitorEntry.attr = execAttr;
     }
 
-
     DPRINTF(BTBPDede, "BTBPDede: updated monitor entry at bank %d, index %d, way %d\n",
         alignedBankIdx, monitorIdx, partitionIdx);
 
     DPRINTF(BTBPDede, "BTBPDede: updated monitor entry details:\n");
     printMonitorEntry(monitorEntry);
 
+    monitorTable[alignedBankIdx][monitorIdx] = toUpdate;
+
+    // update monitor PLRU state
+    auto currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
+    auto newPLRUState = getTouchedPLRUState(
+        currentPLRUState,
+        numWays,
+        partitionIdx
+    );
+     monitorPLRUTable[alignedBankIdx][monitorIdx] = newPLRUState;
+    DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
+        alignedBankIdx, monitorIdx, currentPLRUState, newPLRUState);
 }
 
 void BTBPDede::printBTBEntry(const BTBEntry& e) {
@@ -728,8 +843,8 @@ void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
 }
 
 void BTBPDede::printPageEntry(const PageEntry& e) {
-    DPRINTF(BTBPDede, "PageEntry: tag:%#lx, ctr:%d, carry:%d\n",
-        e.tag, e.ctr, (int)e.carry.targetCarry);
+    DPRINTF(BTBPDede, "PageEntry: tag:%#lx, ctr:%d\n",
+        e.tag, e.ctr);
 }
 
 }
