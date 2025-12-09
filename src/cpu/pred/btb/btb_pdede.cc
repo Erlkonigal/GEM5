@@ -1,4 +1,5 @@
 #include "btb_pdede.hh"
+#include "cpu/o3/dyn_inst.hh"
 
 namespace gem5 {
 namespace branch_prediction {
@@ -15,7 +16,8 @@ BTBPDede::BTBPDede(const Params& p):
     numRegionWays(p.numRegionWays),
     tagBits(p.tagBits),
     tagFoldedBits(p.tagFoldedBits),
-    pageBits(p.pageBits)
+    pageBits(p.pageBits),
+    stats(this)
 {
     /*
         Totally 8192 entries
@@ -38,7 +40,7 @@ BTBPDede::BTBPDede(const Params& p):
             each entry in a way has pageBits bits of tag
             we use targetOffset bits [11:7] to index the page table
             if cross-page, we use Cat(pcHigher, pageTag, targetOffset, 0.B(instShiftAmt)) to form the full target
-            otherwise, we use Cat(pcHigher, pagePointerWway, targetOffset, 0.B(instShiftAmt)) to form the full target
+            otherwise, we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
 
         We choose Solution 1 when numWays == 4, Solution 2 when numWays == 8
     */
@@ -315,6 +317,8 @@ unsigned BTBPDede::getTouchedPLRUState(unsigned state, unsigned numWays, unsigne
         assert(false); // should not reach here
     }
 
+    assert(touchedState < (1 << (numWays - 1)));
+
     return touchedState;
 }
 
@@ -358,6 +362,8 @@ unsigned BTBPDede::getMakeVictimPLRUState(unsigned state, unsigned numWays, unsi
         assert(false); // should not reach here
     }
 
+    assert(victimizedState < (1 << (numWays - 1)));
+
     return victimizedState;
 }
 
@@ -376,14 +382,22 @@ Addr BTBPDede::getMonitorTag(Addr pc)
     // use folded xor for higher tagFoldedBits bits
     Addr tagHigher = 0;
     Addr tagLower = fullTag & mask(tagBits - tagFoldedBits);
+
+    // if no folded bits, return directly
+    if (tagFoldedBits == 0) return tagLower;
+
+    // fold higher bits
+    fullTag = fullTag >> (tagBits - tagFoldedBits);
     for (unsigned i = 0; i < tagBits; i += tagFoldedBits) {
         tagHigher ^= (fullTag & mask(tagFoldedBits));
         fullTag = fullTag >> tagFoldedBits;
     }
+    tagHigher = tagHigher << (tagBits - tagFoldedBits);
 
-    if (tagFoldedBits == 0) assert(tagHigher == 0);
+    // lower and higher should not overlap
+    assert((tagLower & tagHigher) == 0);
 
-    return tagLower | (tagHigher << (tagBits - tagFoldedBits));
+    return tagLower | tagHigher;
 }
 
 std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
@@ -401,22 +415,22 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
         res[phyBankIdx] = monitorSet;
     }
 
-    meta->rawMonitorSets = res;
+    meta = std::make_shared<BTBPDedeMeta>(res);
 
     return res;
 }
 
-Addr BTBPDede::getPageTableIdx(Addr pc) {
+Addr BTBPDede::getPageTableIdx(Addr target) {
     // select high floorLog2(numPageSets) bits from targetOffset
     // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
     // then we select bits [11:11-5+1] = bits [11:7] from targetOffset
     unsigned setWidth = floorLog2(numPageSets);
-    Addr idx = (pc >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
+    Addr idx = (target >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
     return idx;
 }
 
-Addr BTBPDede::getPageTableTag(Addr pc) {
-    Addr fullTag = pc >> (maxOffsetBits + instShiftAmt);
+Addr BTBPDede::getPageTableTag(Addr target) {
+    Addr fullTag = target >> (maxOffsetBits + instShiftAmt);
     return fullTag & mask(pageBits);
 }
 
@@ -453,22 +467,21 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             DPRINTF(BTBPDede, "BTBPDede: entry details - isCond %d, isIndirect %d, isCall %d, isReturn %d\n",
                 btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn);
 
-            // update entry LRU state
-            unsigned alignedBankIdx = getRotatedAlignBankIdx(alignedAddr, i);
+            // update entry PLRU state
             Addr monitorIdx = getMonitorIdx(alignedAddr);
-            unsigned currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
+            unsigned currentPLRUState = monitorPLRUTable[phyBankIdx][monitorIdx];
             unsigned touchedPLRUState = getTouchedPLRUState(
                 currentPLRUState,
                 numWays,
                 way
             );
-            monitorPLRUTable[alignedBankIdx][monitorIdx] = touchedPLRUState;
+            monitorPLRUTable[phyBankIdx][monitorIdx] = touchedPLRUState;
             DPRINTF(BTBPDede, "BTBPDede: touched monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
-                alignedBankIdx, monitorIdx, currentPLRUState, touchedPLRUState);
+                phyBankIdx, monitorIdx, currentPLRUState, touchedPLRUState);
 
             // update page table LRU state if using page pointer
             if (entry.isUsePagePointer() && entry.isCrossPage) {
-                Addr pageTableIdx = getPageTableIdx(alignedAddr);
+                Addr pageTableIdx = getPageTableIdx(entry.targetOffset << instShiftAmt);
                 unsigned currentPagePLRUState = pagePLRUTable[pageTableIdx];
                 unsigned touchedPagePLRUState = getTouchedPLRUState(
                     currentPagePLRUState,
@@ -486,6 +499,16 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             return a.pc < b.pc;
         }
     );
+
+    if (btbEntries.size()) {
+        stats.predHitTimes++;
+    }
+    else {
+        stats.predMissTimes++;
+    }
+
+    stats.predHitEntries += btbEntries.size();
+
     return btbEntries;
 }
 
@@ -524,6 +547,31 @@ void BTBPDede::fillStagePredictions(
         stagePreds[s].condTakens.clear();
         stagePreds[s].indirectTargets.clear();
     }
+
+        // Set predictions for each branch
+    for (auto &e : btbEntries) {
+        assert(e.valid);
+        if (e.isCond) {
+            // TODO: a performance bug here, mbtb should not update condTakens!
+            // if (isL0()) {  // only L0 BTB has saturating counter
+            // use saturating counter of L0 BTB
+
+            // FillStageLoop(s) stagePreds[s].condTakens.push_back({e.pc, e.alwaysTaken || (e.ctr >= 0)});
+
+            // } else {  // L1 BTB condTakens depends on the TAGE predictor
+            // }
+        } else if (e.isIndirect) {
+            // Set predicted target for indirect branches
+            DPRINTF(BTBPDede, "setting indirect target for pc %#lx to %#lx\n", e.pc, e.target);
+
+            FillStageLoop(s) stagePreds[s].indirectTargets.push_back({e.pc, e.target});
+
+            if (e.isReturn) {
+                FillStageLoop(s) stagePreds[s].returnTarget = e.target;
+            }
+            break;
+        }
+    }
 }
 
 void BTBPDede::putPCHistory(
@@ -533,6 +581,7 @@ void BTBPDede::putPCHistory(
 )
 {
     DPRINTF(BTBPDede, "===== BTBPDede: putPCHistory called for startAddr %#lx =====\n", startAddr);
+    stats.predTimes++;
 
     meta = std::make_shared<BTBPDedeMeta>();
     // Lookup monitor entries
@@ -553,7 +602,7 @@ unsigned BTBPDede::getTargetDiffBits(Addr pc, Addr target) {
     return diffBits;
 }
 
-unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const std::shared_ptr<BTBPDedeMeta> &meta) {
+unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &meta) {
     Addr pc = exec.pc;
     Addr target = exec.target;
     bool isReturn = exec.isReturn;
@@ -583,7 +632,7 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const std::shared_ptr
     bool foundEmpty = false;
     for (unsigned i = startIdx; i < wayOffsetBits.size(); ++i) {
         // choose the first way that is empty
-        if (!meta->rawMonitorSets[alignBankIdx][i].valid) {
+        if (!meta[i].valid) {
             finalIdx = i;
             foundEmpty = true;
             break;
@@ -634,11 +683,12 @@ void BTBPDede::update(const FetchStream& stream) {
         return;
     }
 
-    if (lastUpdateTick == stream.predTick) {
-        DPRINTF(BTBPDede, "BTBPDede: update skipped due to already updated in this prediction tick\n");
-        return;
-    }
+    // if (lastUpdateTick == stream.predTick) {
+    //     DPRINTF(BTBPDede, "BTBPDede: update skipped due to already updated in this prediction tick\n");
+    //     return;
+    // }
 
+    stats.updateTimes++;
     lastUpdateTick = stream.predTick;
 
     auto metaFromUpdate =
@@ -649,7 +699,11 @@ void BTBPDede::update(const FetchStream& stream) {
     unsigned monitorIdx = getMonitorIdx(exec.pc);
     unsigned alignedPosition = (exec.pc & (blockSize - 1)) >> instShiftAmt;
 
-    MonitorSet toUpdate = metaFromUpdate->rawMonitorSets[alignedBankIdx];
+
+    // MonitorSet toUpdate = metaFromUpdate->rawMonitorSets[alignedBankIdx];
+
+    // ideal entries from current monitor table
+    auto &toUpdate = monitorTable[alignedBankIdx][monitorIdx];
 
     BranchAttribute execAttr({
         exec.isCond ? BranchAttribute::BranchTypeEnum::Conditional :
@@ -660,23 +714,13 @@ void BTBPDede::update(const FetchStream& stream) {
                 BranchAttribute::RasActionEnum::None)
     });
 
-
-    // TODO: is really need this check?
-    // bool mispredHitMeta = false;
-    // for (auto &entry : metaFromUpdate->rawMonitorSets[alignedBankIdx]) {
-    //     if (!entry.valid) continue; // skip invalid entries
-    //     if (!(entry.attr.branchType == execAttr.branchType &&
-    //           entry.attr.rasAction == execAttr.rasAction)) continue; // skip different attributes
-    //     if (entry.position != alignedPosition) continue; // skip different position
-    //     mispredHitMeta = true;
-    //     break;
-    // }
-
-    // if mispredHitMeta, we can infer that BTB is not responsible for the misprediction
-    // if (mispredHitMeta) return;
-
     unsigned targetDiffBits = getTargetDiffBits(exec.pc, exec.target);
-    unsigned partitionIdx = getPartitionIdx(exec, metaFromUpdate);
+
+    // unsigned partitionIdx = getPartitionIdx(exec, metaFromUpdate);
+
+    // ideal meta from current monitor table
+    unsigned partitionIdx = getPartitionIdx(exec, toUpdate);
+
     bool usePagePointer = wayUsePagePointer[partitionIdx];
 
     // find entry already hit in monitor table
@@ -687,12 +731,17 @@ void BTBPDede::update(const FetchStream& stream) {
         if (entry.position != alignedPosition) continue; // skip different position
         if (entry.tag != getMonitorTag(exec.pc)) continue; // skip different tag
         foundWay = way;
+        stats.updateHitTimes++;
         break;
     }
 
-    if (foundWay != -1 && foundWay != partitionIdx) {
+    if (foundWay == -1) {
+        stats.updateMissTimes++;
+    }
+    else if (foundWay != partitionIdx) {
         DPRINTF(BTBPDede, "BTBPDede: found existing monitor entry in way %d, need to invalid\n",
             foundWay);
+        stats.updateMultiHitTimes++;
         // invalidate the found entry
         toUpdate[foundWay].valid = false;
         // update PLRU state
@@ -718,14 +767,15 @@ void BTBPDede::update(const FetchStream& stream) {
     monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.getOffsetBits());
     if (usePagePointer && (targetDiffBits > maxOffsetBits + floorLog2(numPageWays))) {
         DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update\n");
+        stats.updateUsePagePointerTimes++;
 
-        Addr pagePointerSet = getPageTableIdx(exec.pc);
+        Addr pagePointerSet = getPageTableIdx(exec.target);
         // check if page entry exists
         Addr pagePointerWay = 0;
         bool pageEntryExists = false;
         for (unsigned way = 0; way < numPageWays; ++way) {
             auto &pageEntry = pageTable[pagePointerSet][way];
-            Addr newTag = getPageTableTag(exec.pc);
+            Addr newTag = getPageTableTag(exec.target);
             Addr entryTag = pageEntry.tag;
             if (entryTag == newTag) {
                 pagePointerWay = way;
@@ -741,6 +791,7 @@ void BTBPDede::update(const FetchStream& stream) {
         }
         else {
             DPRINTF(BTBPDede, "BTBPDede: page entry does not exist, allocating new entry\n");
+            stats.updateAllocatePagePointerTimes++;
             // choose victim way using PLRU
             auto plruState = pagePLRUTable[pagePointerSet];
             auto plruVictims = getPLRUVictims(plruState, numPageWays);
@@ -751,7 +802,7 @@ void BTBPDede::update(const FetchStream& stream) {
             DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
                 pagePointerSet, pagePointerWay);
             auto &pageEntry = pageTable[pagePointerSet][pagePointerWay];
-            pageEntry.tag = getPageTableTag(exec.pc);
+            pageEntry.tag = getPageTableTag(exec.target);
             DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
             printPageEntry(pageEntry);
 
@@ -776,6 +827,7 @@ void BTBPDede::update(const FetchStream& stream) {
     }
     else if (usePagePointer && (targetDiffBits <= maxOffsetBits + floorLog2(numPageWays))) {
         DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update (not cross page)\n");
+        stats.updateNotUseButHasPagePointerTimes++;
 
         monitorEntry.isCrossPage = false;
         monitorEntry.pagePointerWay = (exec.target >> (maxOffsetBits + instShiftAmt)) & mask(floorLog2(numPageWays));
@@ -789,6 +841,7 @@ void BTBPDede::update(const FetchStream& stream) {
     }
     else {
         DPRINTF(BTBPDede, "BTBPDede: not using page pointer for monitor entry update\n");
+        stats.updateNotUseAndNoPagePointerTimes++;
         monitorEntry.carry = computeCarryBits(
             exec.pc,
             exec.target,
@@ -803,7 +856,7 @@ void BTBPDede::update(const FetchStream& stream) {
     DPRINTF(BTBPDede, "BTBPDede: updated monitor entry details:\n");
     printMonitorEntry(monitorEntry);
 
-    monitorTable[alignedBankIdx][monitorIdx] = toUpdate;
+    // monitorTable[alignedBankIdx][monitorIdx] = toUpdate;
 
     // update monitor PLRU state
     auto currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
@@ -846,6 +899,115 @@ void BTBPDede::printPageEntry(const PageEntry& e) {
     DPRINTF(BTBPDede, "PageEntry: tag:%#lx, ctr:%d\n",
         e.tag, e.ctr);
 }
+
+void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
+    auto meta = std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
+    const auto &rawEntries = *meta;
+
+    auto pc = inst->getPC();
+    auto npc = inst->getNPC();
+    Addr alignedAddr = pc & ~(blockSize - 1);
+    unsigned alignBankIdx = getRotatedAlignBankIdx(pc, 0);
+    Addr monitorIdx = getMonitorIdx(alignedAddr);
+
+    bool branchHit = false;
+    unsigned hitWay = numWays;
+    for (unsigned way = 0; way < numWays; ++way) {
+        const auto &entry = rawEntries[alignBankIdx][way];
+        Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
+        if (!entry.valid) continue;
+        if (entry.tag != getMonitorTag(alignedAddr)) continue;
+        if (branchPC != pc) continue;
+        branchHit = true;
+        hitWay = way;
+        break;
+    }
+
+    bool condNotTaken = inst->isCondCtrl() && !inst->branching();
+    bool hitBranchTaken = stream.exeTaken && stream.getControlPC() == pc;
+
+    unsigned targetDiffBits = getTargetDiffBits(pc, npc);
+
+    stats.totalBranchHits += branchHit;
+    stats.totalBranchMisses += !branchHit;
+
+    if (inst->isCondCtrl()) {
+        stats.condTargetDiffBits.sample(targetDiffBits);
+        stats.condHits += branchHit;
+        stats.condMisses += !branchHit;
+    }
+    if (inst->isUncondCtrl()) {
+        stats.uncondTargetDiffBits.sample(targetDiffBits);
+        stats.uncondHits += branchHit;
+        stats.uncondMisses += !branchHit;
+    }
+    if (inst->isIndirectCtrl()) {
+        stats.indirectTargetDiffBits.sample(targetDiffBits);
+        stats.indirectHits += branchHit;
+        stats.indirectMisses += !branchHit;
+    }
+    if (inst->isCall()) {
+        stats.callTargetDiffBits.sample(targetDiffBits);
+        stats.callHits += branchHit;
+        stats.callMisses += !branchHit;
+    }
+    if (inst->isReturn()) {
+        stats.returnTargetDiffBits.sample(targetDiffBits);
+        stats.returnHits += branchHit;
+        stats.returnMisses += !branchHit;
+    }
+}
+
+BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
+    statistics::Group(parent, "BTBPDede"),
+    ADD_STAT(predTimes, statistics::units::Count::get(), "Number of predictions made"),
+    ADD_STAT(predMissTimes, statistics::units::Count::get(), "Number of prediction misses"),
+    ADD_STAT(predHitTimes, statistics::units::Count::get(), "Number of prediction hits"),
+    ADD_STAT(predHitEntries, statistics::units::Count::get(), "Number of predicted entries hit"),
+    ADD_STAT(updateTimes, statistics::units::Count::get(), "Number of updates made"),
+    ADD_STAT(updateMissTimes, statistics::units::Count::get(), "Number of update misses"),
+    ADD_STAT(updateFoundEmptyTimes, statistics::units::Count::get(),"Number of update where an empty entry was found"),
+    ADD_STAT(updateEvictTimes, statistics::units::Count::get(),"Number of update where an entry was evicted"),
+    ADD_STAT(updateHitTimes, statistics::units::Count::get(), "Number of update hits"),
+    ADD_STAT(updateMultiHitTimes, statistics::units::Count::get(), "Number of update multi-hits"),
+    ADD_STAT(updateUsePagePointerTimes, statistics::units::Count::get(),
+        "Number of updates using page pointer"),
+    ADD_STAT(updateAllocatePagePointerTimes, statistics::units::Count::get(),
+        "Number of updates allocating new page pointer"),
+    ADD_STAT(updateNotUseButHasPagePointerTimes, statistics::units::Count::get(),
+        "Number of updates not using page pointer but having page pointer"),
+    ADD_STAT(updateNotUseAndNoPagePointerTimes, statistics::units::Count::get(),
+        "Number of updates not using page pointer and no page pointer"),
+    ADD_STAT(totalBranchHits, statistics::units::Count::get(), "Total number of branch hits in BTB"),
+    ADD_STAT(totalBranchMisses, statistics::units::Count::get(), "Total number of branch misses in BTB"),
+    ADD_STAT(condHits, statistics::units::Count::get(), "Number of conditional branch hits"),
+    ADD_STAT(condMisses, statistics::units::Count::get(), "Number of conditional branch misses"),
+    ADD_STAT(uncondHits, statistics::units::Count::get(), "Number of unconditional branch hits"),
+    ADD_STAT(uncondMisses, statistics::units::Count::get(), "Number of unconditional branch misses"),
+    ADD_STAT(indirectHits, statistics::units::Count::get(), "Number of indirect branch hits"),
+    ADD_STAT(indirectMisses, statistics::units::Count::get(), "Number of indirect branch misses"),
+    ADD_STAT(callHits, statistics::units::Count::get(), "Number of call branch hits"),
+    ADD_STAT(callMisses, statistics::units::Count::get(), "Number of call branch misses"),
+    ADD_STAT(returnHits, statistics::units::Count::get(), "Number of return branch hits"),
+    ADD_STAT(returnMisses, statistics::units::Count::get(), "Number of return branch misses"),
+    ADD_STAT(condTargetDiffBits, statistics::units::Count::get(),
+        "Target difference bits for conditional branch updates"),
+    ADD_STAT(uncondTargetDiffBits, statistics::units::Count::get(),
+        "Target difference bits for unconditional branonds"),
+    ADD_STAT(indirectTargetDiffBits, statistics::units::Count::get(),
+        "Target difference bits for indirect branch updates"),
+    ADD_STAT(callTargetDiffBits, statistics::units::Count::get(),
+        "Target difference bits for call branch updates"),
+    ADD_STAT(returnTargetDiffBits, statistics::units::Count::get(),
+        "Target difference bits for return branch updates")
+{
+    condTargetDiffBits.init(0, 64, 1);
+    uncondTargetDiffBits.init(0, 64, 1);
+    indirectTargetDiffBits.init(0, 64, 1);
+    callTargetDiffBits.init(0, 64, 1);
+    returnTargetDiffBits.init(0, 64, 1);
+}
+
 
 }
 }

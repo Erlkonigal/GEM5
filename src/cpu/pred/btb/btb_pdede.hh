@@ -8,6 +8,7 @@
     #include "cpu/pred/btb/test/test_dprintf.hh"
 #else
     #include "debug/BTBPDede.hh"
+    #include "debug/PDedeStats.hh"
     #include "params/BTBPDede.hh"
     #include "sim/sim_object.hh"
 #endif
@@ -119,10 +120,11 @@ private:
     };
     typedef std::vector<RegionEntry> RegionSet;
 
-    struct BTBPDedeMeta
-    {
-        std::vector<MonitorSet> rawMonitorSets;
-    };
+    // struct BTBPDedeMeta
+    // {
+    //     std::vector<MonitorSet> rawMonitorSets;
+    // };
+    typedef std::vector<MonitorSet> BTBPDedeMeta;
 
     typedef std::vector<unsigned> ReplacementAlignBank;
 
@@ -149,8 +151,8 @@ private:
     Addr getMonitorTag(Addr pc);
     std::vector<MonitorSet> getMonitorEntries(Addr pc);
 
-    Addr getPageTableIdx(Addr pc);
-    Addr getPageTableTag(Addr pc);
+    Addr getPageTableIdx(Addr target);
+    Addr getPageTableTag(Addr target);
 
     std::vector<BTBEntry> processMonitorEntries(Addr pc, const std::vector<MonitorSet>& monitorSets);
     void fillStagePredictions(
@@ -159,13 +161,61 @@ private:
     );
 
     unsigned getTargetDiffBits(Addr pc, Addr target);
-    unsigned getPartitionIdx(const BranchInfo &exec, const std::shared_ptr<BTBPDedeMeta> &meta);
+    unsigned getPartitionIdx(const BranchInfo &exec, const MonitorSet &meta);
 
     void printBTBEntry(const BTBEntry& e);
     void dumpBTBEntries(const std::vector<BTBEntry>& es);
 
     void printMonitorEntry(const MonitorEntry& e);
     void printPageEntry(const PageEntry& e);
+
+    typedef statistics::Scalar Scalar;
+    struct PDedeStats : public statistics::Group
+    {
+        Scalar predTimes;
+        Scalar predMissTimes;
+        Scalar predHitTimes;
+        Scalar predHitEntries;
+
+        Scalar updateTimes;
+        Scalar updateMissTimes;
+        Scalar updateFoundEmptyTimes;
+        Scalar updateEvictTimes;
+
+        Scalar updateHitTimes;
+        Scalar updateMultiHitTimes;
+
+        Scalar updateUsePagePointerTimes;
+        Scalar updateAllocatePagePointerTimes;
+        Scalar updateNotUseButHasPagePointerTimes;
+        Scalar updateNotUseAndNoPagePointerTimes;
+
+        Scalar totalBranchHits;
+        Scalar totalBranchMisses;
+
+        Scalar condHits;
+        Scalar condMisses;
+
+        Scalar uncondHits;
+        Scalar uncondMisses;
+
+        Scalar indirectHits;
+        Scalar indirectMisses;
+
+        Scalar callHits;
+        Scalar callMisses;
+
+        Scalar returnHits;
+        Scalar returnMisses;
+
+        statistics::Distribution condTargetDiffBits;
+        statistics::Distribution uncondTargetDiffBits;
+        statistics::Distribution indirectTargetDiffBits;
+        statistics::Distribution callTargetDiffBits;
+        statistics::Distribution returnTargetDiffBits;
+
+        PDedeStats(statistics::Group* parent);
+    } stats;
 
 public:
     BTBPDede(const Params& p);
@@ -178,6 +228,8 @@ public:
     std::shared_ptr<void> getPredictionMeta() override;
 
     void update(const FetchStream& stream) override;
+
+    void commitBranch(const FetchStream &stream, const DynInstPtr &inst) override;
 };
 
 }
