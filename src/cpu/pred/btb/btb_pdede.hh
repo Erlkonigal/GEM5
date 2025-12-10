@@ -160,7 +160,7 @@ private:
     Addr getPageTableIdx(Addr target);
     Addr getPageTableTag(Addr target);
 
-    Addr getVictimCacheTag(Addr pc);
+    Addr getVictimCacheTag(Addr monitorTag, Addr monitorIdx);
 
     std::vector<BTBEntry> processMonitorEntries(Addr pc, const std::vector<MonitorSet>& monitorSets);
     void fillStagePredictions(
@@ -184,6 +184,8 @@ private:
         Scalar predMissTimes;
         Scalar predHitTimes;
         Scalar predHitEntries;
+        Scalar predHitVictimTimes;
+        Scalar predHitVictimEntries;
 
         Scalar updateTimes;
         Scalar updateMissTimes;

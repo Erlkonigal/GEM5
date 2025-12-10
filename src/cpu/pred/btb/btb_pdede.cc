@@ -417,14 +417,6 @@ Addr BTBPDede::getMonitorTag(Addr pc)
     return tagLower | tagHigher;
 }
 
-Addr BTBPDede::getVictimCacheTag(Addr pc)
-{
-    unsigned fetchBlockWidth = floorLog2(predictWidth);
-    unsigned monitorSetWidth = floorLog2(numSets);
-    Addr fullTag = pc >> fetchBlockWidth;
-    return fullTag & mask(tagBits + monitorSetWidth);
-}
-
 std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
 {
     std::vector<MonitorSet> res(numAlignBanks);
@@ -459,6 +451,13 @@ Addr BTBPDede::getPageTableTag(Addr target) {
     return fullTag & mask(pageBits);
 }
 
+Addr BTBPDede::getVictimCacheTag(Addr monitorTag, Addr monitorIdx)
+{
+    unsigned monitorSetWidth = floorLog2(numSets);
+    Addr victimTag = (monitorTag << monitorSetWidth) | monitorIdx;
+    return victimTag;
+}
+
 std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector<MonitorSet> &originEntries)
 {
     auto monitorEntries = originEntries;
@@ -469,23 +468,30 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
         unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
         auto &bank = monitorEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
+        bool foundInVictimCache = false;
         for (unsigned way = 0; way < numWays + numVictimCacheSets; ++way) {
             MonitorEntry &entry =
                 (way < numWays) ? bank[way] : victimCache[phyBankIdx][way - numWays];
 
             Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
+            Addr monitorIdx = getMonitorIdx(alignedAddr);
+            Addr monitorTag = getMonitorTag(alignedAddr);
+            Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
+
             if (!entry.valid) continue;
             if (branchPC < pc || branchPC >= (pc + predictWidth)) continue;
-            // if (entry.tag != getMonitorTag(alignedAddr)) continue;
-            if (entry.tag != (way < numWays ?
-                getMonitorTag(alignedAddr) :
-                getVictimCacheTag(alignedAddr))) continue;
+            if (entry.tag != (way < numWays ? monitorTag : victimTag)) continue;
 
             DPRINTF(BTBPDede, "BTBPDede: use entry from %s way %d for bank %d alignedAddr %#lx\n",
                 (way < numWays) ? "monitor" : "victim cache",
                 (way < numWays) ? way : (way - numWays),
                 phyBankIdx,
                 alignedAddr);
+
+            if (way >= numWays) {
+                foundInVictimCache = true;
+                stats.predHitVictimEntries++;
+            }
 
             BTBEntry btbEntry;
             btbEntry.valid = true;
@@ -518,7 +524,6 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             }
 
             // update entry PLRU state
-            Addr monitorIdx = getMonitorIdx(alignedAddr);
             unsigned currentPLRUState = monitorPLRUTable[phyBankIdx][monitorIdx];
             unsigned touchedPLRUState = getTouchedPLRUState(
                 currentPLRUState,
@@ -543,7 +548,13 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
                     pageTableIdx, currentPagePLRUState, touchedPagePLRUState);
             }
         }
+
+        if (foundInVictimCache) {
+            stats.predHitVictimTimes++;
+        }
     }
+
+
     std::sort(btbEntries.begin(), btbEntries.end(),
         [](const BTBEntry &a, const BTBEntry &b) {
             return a.pc < b.pc;
@@ -685,8 +696,7 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &met
         return wayOffsetBits.size() - 1;
     };
 
-    unsigned diffBits = // if is return, we can allocate it to any partition
-        !isReturn ? getTargetDiffBits(pc, target) : 0;
+    unsigned diffBits = getTargetDiffBits(pc, target);
     unsigned startIdx = getSmallestPartitionIdx(diffBits);
     unsigned finalIdx = startIdx;
     bool foundEmpty = false;
@@ -706,11 +716,12 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &met
      *       and choose the first one among the rest.
      */
     if (foundEmpty) {
+        stats.updateFoundEmptyTimes++;
         DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (empty) for pc %#lx\n",
             finalIdx, pc);
         return finalIdx;
     }
-
+    stats.updateEvictTimes++;
     auto monitorIdx = getMonitorIdx(alignedPC);
     auto plruState = monitorPLRUTable[alignBankIdx][monitorIdx];
     auto plruVictims = getPLRUVictims(plruState, numWays);
@@ -735,7 +746,7 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &met
     MonitorEntry &victimEntry = victimCache[alignBankIdx][victimWay];
 
     victimEntry = toEvictEntry;
-    victimEntry.tag = getVictimCacheTag(alignedPC);
+    victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
 
     DPRINTF(BTBPDede, "BTBPDede: victim entry details - position %d, tag %#lx, targetOffset %#lx, "
         "isUsePagePointer %d, pagePointerWay %d, isCrossPage %d, carry %#x\n",
@@ -1054,6 +1065,10 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(predMissTimes, statistics::units::Count::get(), "Number of prediction misses"),
     ADD_STAT(predHitTimes, statistics::units::Count::get(), "Number of prediction hits"),
     ADD_STAT(predHitEntries, statistics::units::Count::get(), "Number of predicted entries hit"),
+    ADD_STAT(predHitVictimTimes, statistics::units::Count::get(),
+        "Number of predicted times from victim cache"),
+    ADD_STAT(predHitVictimEntries, statistics::units::Count::get(),
+        "Number of predicted entries from victim cache"),
     ADD_STAT(updateTimes, statistics::units::Count::get(), "Number of updates made"),
     ADD_STAT(updateMissTimes, statistics::units::Count::get(), "Number of update misses"),
     ADD_STAT(updateFoundEmptyTimes, statistics::units::Count::get(),"Number of update where an empty entry was found"),
