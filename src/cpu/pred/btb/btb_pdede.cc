@@ -237,6 +237,7 @@ BTBPDede::TargetCarry BTBPDede::computeCarryBits(Addr pc, Addr target, unsigned 
         carry.targetCarry = TargetCarry::TargetCarryEnum::None;
     }
 
+    stats.carryOverflowTimes += carry.isNone();
     return carry;
 }
 
@@ -748,11 +749,31 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &met
     DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (PLRU) for pc %#lx\n",
         finalIdx, pc);
 
+    if (victimCacheEntries == 0) return finalIdx; // no victim cache configured
+
     // put victim entry into victim cache
-    unsigned victimWay = getPLRUVictims(
-        victimCachePLRUTable[alignBankIdx],
-        numVictimCacheSets
-    )[0];
+
+    // firstly find invalid entry in victim cache
+    unsigned victimWay = -1;
+    for (unsigned way = 0; way < numVictimCacheSets; ++way) {
+        auto &entry = victimCache[alignBankIdx][way];
+        if (!entry.valid) {
+            victimWay = way;
+            // stats.updateVictimCacheFoundEmptyTimes++;
+            DPRINTF(BTBPDede, "BTBPDede: found empty victim cache way %d for bank %d\n",
+                victimWay, alignBankIdx);
+            break;
+        }
+    }
+
+    if (victimWay == -1) {
+        // no empty entry, use victim cache PLRU to choose victim
+        victimWay = getPLRUVictims(
+            victimCachePLRUTable[alignBankIdx],
+            numVictimCacheSets
+        )[0];
+    }
+
     const MonitorEntry &toEvictEntry = meta[finalIdx];
     MonitorEntry &victimEntry = victimCache[alignBankIdx][victimWay];
 
@@ -842,12 +863,16 @@ void BTBPDede::update(const FetchStream& stream) {
         if (!entry.valid) continue; // skip invalid entries
         if (entry.position != alignedPosition) continue; // skip different position
         if (entry.tag != getMonitorTag(exec.pc)) continue; // skip different tag
-        foundWay = way;
-        stats.updateHitTimes++;
-        break;
+
+        entry.valid = false; // invalidate the monitor entry after hit
+        if (foundWay == -1) {
+            foundWay = way;
+            stats.updateHitTimes++;
+        }
     }
 
     // find entry already hit in victim cache
+    unsigned foundVictimWay = -1;
     for (unsigned way = 0; way < numVictimCacheSets; ++way) {
         auto &entry = victimCache[alignedBankIdx][way];
         Addr monitorTag = getMonitorTag(exec.pc);
@@ -858,24 +883,21 @@ void BTBPDede::update(const FetchStream& stream) {
         if (entry.position != alignedPosition) continue; // skip different position
         if (entry.tag != victimTag) continue; // skip different tag
 
-        entry.targetOffset = (exec.target >> instShiftAmt) & mask(entry.getOffsetBits());
-        entry.carry = computeCarryBits(
-            exec.pc,
-            exec.target,
-            entry.getOffsetBits()
-        );
-        entry.attr = execAttr;
-
-        stats.carryOverflowTimes += entry.carry.isNone();
-
-        stats.updateHitVictimTimes++;
-        break;
+        entry.valid = false; // invalidate the victim cache entry after hit
+        if (foundVictimWay == -1) {
+            entry.valid = true;
+            entry.targetOffset = (exec.target >> instShiftAmt) & mask(entry.getOffsetBits());
+            entry.carry = computeCarryBits(
+                exec.pc,
+                exec.target,
+                entry.getOffsetBits()
+            );
+            entry.attr = execAttr;
+            stats.updateHitVictimTimes++;
+        }
     }
 
-    if (foundWay == -1) {
-        stats.updateMissTimes++;
-    }
-    else if (foundWay != partitionIdx) {
+    if (foundWay != partitionIdx && foundWay != -1) {
         DPRINTF(BTBPDede, "BTBPDede: found existing monitor entry in way %d, need to invalid\n",
             foundWay);
         stats.updateMultiHitTimes++;
@@ -893,6 +915,9 @@ void BTBPDede::update(const FetchStream& stream) {
         monitorPLRUTable[alignedBankIdx][monitorIdx] = newPLRUState;
         DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
             alignedBankIdx, monitorIdx, currentPLRUState, newPLRUState);
+    }
+    else if (foundWay == -1 && foundVictimWay == -1) {
+        stats.updateMissTimes++;
     }
 
     MonitorEntry &monitorEntry = toUpdate[partitionIdx];
