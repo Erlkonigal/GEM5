@@ -44,8 +44,10 @@ private:
     // TODO: offset bits need profiling to decide
     const unsigned maxOffsetBits = 11;
 
-    const std::vector<unsigned> way4OffsetBits = {11, 11, maxOffsetBits, maxOffsetBits};
-    const std::vector<bool> way4UsePagePointer = {false, false, true, true};
+    // const std::vector<unsigned> way4OffsetBits = {11, 11, maxOffsetBits, maxOffsetBits};
+    // const std::vector<bool> way4UsePagePointer = {false, false, true, true};
+    const std::vector<unsigned> way4OffsetBits = {maxOffsetBits, maxOffsetBits, maxOffsetBits, maxOffsetBits};
+    const std::vector<bool> way4UsePagePointer = {true, true, true, true};
 
     const std::vector<unsigned> way8OffsetBits = {0, 4, 5, 7, 9, 11, maxOffsetBits, maxOffsetBits};
     const std::vector<bool> way8UsePagePointer = {false, false, false, false,
@@ -80,6 +82,9 @@ private:
         }
         bool isMinusOne() const {
             return targetCarry == TargetCarryEnum::MinusOne;
+        }
+        bool isNone() const {
+            return targetCarry == TargetCarryEnum::None;
         }
     };
 
@@ -122,11 +127,12 @@ private:
     };
     typedef std::vector<RegionEntry> RegionSet;
 
-    // struct BTBPDedeMeta
-    // {
-    //     std::vector<MonitorSet> rawMonitorSets;
-    // };
-    typedef std::vector<MonitorSet> BTBPDedeMeta;
+    struct BTBPDedeMeta
+    {
+        std::vector<MonitorSet> rawMonitorSets;
+        std::vector<BTBEntry> btbEntries;
+    };
+    // typedef std::vector<MonitorSet> BTBPDedeMeta;
 
     typedef std::vector<unsigned> ReplacementAlignBank;
 
@@ -200,6 +206,8 @@ private:
         Scalar updateAllocatePagePointerTimes;
         Scalar updateNotUseButHasPagePointerTimes;
         Scalar updateNotUseAndNoPagePointerTimes;
+
+        Scalar carryOverflowTimes;
 
         Scalar totalBranchHits;
         Scalar totalBranchMisses;

@@ -432,8 +432,6 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
         res[phyBankIdx] = monitorSet;
     }
 
-    meta = std::make_shared<BTBPDedeMeta>(res);
-
     return res;
 }
 
@@ -580,6 +578,14 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
 
     stats.predHitEntries += btbEntries.size();
 
+
+    BTBPDedeMeta newMeta;
+    newMeta.rawMonitorSets = originEntries;
+    newMeta.btbEntries = btbEntries;
+
+    meta = std::make_shared<BTBPDedeMeta>(newMeta);
+
+
     return btbEntries;
 }
 
@@ -654,7 +660,6 @@ void BTBPDede::putPCHistory(
     DPRINTF(BTBPDede, "===== BTBPDede: putPCHistory called for startAddr %#lx =====\n", startAddr);
     stats.predTimes++;
 
-    meta = std::make_shared<BTBPDedeMeta>();
     // Lookup monitor entries
     auto monitorEntries = getMonitorEntries(startAddr);
 
@@ -725,15 +730,21 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &met
     auto monitorIdx = getMonitorIdx(alignedPC);
     auto plruState = monitorPLRUTable[alignBankIdx][monitorIdx];
     auto plruVictims = getPLRUVictims(plruState, numWays);
-    for (auto way : plruVictims) {
-        if (way >= startIdx) {
-            finalIdx = way;
-            break;
-        }
-    }
-    for (auto way : plruVictims) {
-        DPRINTF(BTBPDede, "BTBPDede: PLRU victim way %d\n", way);
-    }
+
+    // Solution 1: choose first PLRU victim that is >= startIdx
+    // for (auto way : plruVictims) {
+    //     if (way >= startIdx) {
+    //         finalIdx = way;
+    //         break;
+    //     }
+    // }
+    // for (auto way : plruVictims) {
+    //     DPRINTF(BTBPDede, "BTBPDede: PLRU victim way %d\n", way);
+    // }
+
+    // Solution 2: directly choose the first PLRU victim
+    finalIdx = plruVictims[0]; // choose the first PLRU victim directly
+
     DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (PLRU) for pc %#lx\n",
         finalIdx, pc);
 
@@ -854,6 +865,8 @@ void BTBPDede::update(const FetchStream& stream) {
             entry.getOffsetBits()
         );
         entry.attr = execAttr;
+
+        stats.carryOverflowTimes += entry.carry.isNone();
 
         stats.updateHitVictimTimes++;
         break;
@@ -1043,25 +1056,19 @@ void BTBPDede::printPageEntry(const PageEntry& e) {
 
 void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
     auto meta = std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
-    const auto &rawEntries = *meta;
+    const auto &rawEntries = meta->rawMonitorSets;
+    const auto &btbEntries = meta->btbEntries;
 
     auto pc = inst->getPC();
     auto npc = inst->getNPC();
-    Addr alignedAddr = pc & ~(blockSize - 1);
-    unsigned alignBankIdx = getRotatedAlignBankIdx(pc, 0);
-    Addr monitorIdx = getMonitorIdx(alignedAddr);
-
     bool branchHit = false;
-    unsigned hitWay = numWays;
-    for (unsigned way = 0; way < numWays; ++way) {
-        const auto &entry = rawEntries[alignBankIdx][way];
-        Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
-        if (!entry.valid) continue;
-        if (entry.tag != getMonitorTag(alignedAddr)) continue;
-        if (branchPC != pc) continue;
-        branchHit = true;
-        hitWay = way;
-        break;
+    auto entry = BTBEntry();
+    for (const auto &e : btbEntries) {
+        if (e.pc == pc) {
+            branchHit = true;
+            entry = e;
+            break;
+        }
     }
 
     bool condNotTaken = inst->isCondCtrl() && !inst->branching();
@@ -1072,30 +1079,89 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
     stats.totalBranchHits += branchHit;
     stats.totalBranchMisses += !branchHit;
 
-    if (inst->isCondCtrl()) {
-        stats.condTargetDiffBits.sample(targetDiffBits);
-        stats.condHits += branchHit;
-        stats.condMisses += !branchHit;
-    }
-    if (inst->isUncondCtrl()) {
-        stats.uncondTargetDiffBits.sample(targetDiffBits);
-        stats.uncondHits += branchHit;
-        stats.uncondMisses += !branchHit;
-    }
-    if (inst->isIndirectCtrl()) {
-        stats.indirectTargetDiffBits.sample(targetDiffBits);
-        stats.indirectHits += branchHit;
-        stats.indirectMisses += !branchHit;
-    }
-    if (inst->isCall()) {
-        stats.callTargetDiffBits.sample(targetDiffBits);
-        stats.callHits += branchHit;
-        stats.callMisses += !branchHit;
-    }
-    if (inst->isReturn()) {
-        stats.returnTargetDiffBits.sample(targetDiffBits);
-        stats.returnHits += branchHit;
-        stats.returnMisses += !branchHit;
+    if (branchHit) {
+        stats.totalBranchHits++;
+        if (hitBranchTaken) {
+            // stats.totalBranchHitTakens++;
+        } else {
+            // stats.totalBranchHitNotTakens++;
+        }
+        if (inst->isCondCtrl()) {
+            stats.condHits++;
+            stats.condTargetDiffBits.sample(targetDiffBits);
+            if (hitBranchTaken) {
+                // stats.condHitTakens++;
+            } else {
+                // stats.condHitNotTakens++;
+            }
+
+            bool pred_taken = entry.ctr >= 0;
+            if (pred_taken == hitBranchTaken) {
+                // stats.condPredCorrect++;
+            } else {
+                // stats.condPredWrong++;
+            }
+
+        }
+        if (inst->isUncondCtrl()) {
+            stats.uncondHits++;
+            stats.uncondTargetDiffBits.sample(targetDiffBits);
+        }
+        // ignore non-speculative branches (e.g. syscall)
+        if (!inst->isNonSpeculative()) {
+            if (inst->isIndirectCtrl()) {
+                stats.indirectHits++;
+                stats.indirectTargetDiffBits.sample(targetDiffBits);
+                Addr pred_target = entry.target;
+                if (pred_target == npc) {
+                    // stats.indirectPredCorrect++;
+                } else {
+                    // stats.indirectPredWrong++;
+                }
+            }
+            if (inst->isCall()) {
+                stats.callHits++;
+                stats.callTargetDiffBits.sample(targetDiffBits);
+            }
+            if (inst->isReturn()) {
+                stats.returnHits++;
+                stats.returnTargetDiffBits.sample(targetDiffBits);
+            }
+        }
+    } else {
+        stats.totalBranchMisses++;
+        if (hitBranchTaken) {
+            // stats.totalBranchMissTakens++;
+        } else {
+            // stats.totalBranchMissNotTakens++;
+        }
+        if (inst->isCondCtrl()) {
+            stats.condMisses++;
+            if (hitBranchTaken) {
+                // stats.condMissTakens++;
+                // stats.condPredWrong++;
+
+            } else {
+                // stats.condMissNotTakens++;
+                // stats.condPredCorrect++;
+            }
+        }
+        if (inst->isUncondCtrl()) {
+            stats.uncondMisses++;
+        }
+        // ignore non-speculative branches (e.g. syscall)
+        if (!inst->isNonSpeculative()) {
+            if (inst->isIndirectCtrl()) {
+                stats.indirectMisses++;
+                // stats.indirectPredWrong++;
+            }
+            if (inst->isCall()) {
+                stats.callMisses++;
+            }
+            if (inst->isReturn()) {
+                stats.returnMisses++;
+            }
+        }
     }
 }
 
@@ -1125,6 +1191,8 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
         "Number of updates not using page pointer but having page pointer"),
     ADD_STAT(updateNotUseAndNoPagePointerTimes, statistics::units::Count::get(),
         "Number of updates not using page pointer and no page pointer"),
+    ADD_STAT(carryOverflowTimes, statistics::units::Count::get(),
+        "Number of times carry overflow occurred during updates"),
     ADD_STAT(totalBranchHits, statistics::units::Count::get(), "Total number of branch hits in BTB"),
     ADD_STAT(totalBranchMisses, statistics::units::Count::get(), "Total number of branch misses in BTB"),
     ADD_STAT(condHits, statistics::units::Count::get(), "Number of conditional branch hits"),
