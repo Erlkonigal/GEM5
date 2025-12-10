@@ -17,6 +17,7 @@ BTBPDede::BTBPDede(const Params& p):
     tagBits(p.tagBits),
     tagFoldedBits(p.tagFoldedBits),
     pageBits(p.pageBits),
+    victimCacheEntries(p.victimCacheEntries),
     stats(this)
 {
     /*
@@ -95,6 +96,22 @@ BTBPDede::BTBPDede(const Params& p):
     for (unsigned set = 0; set < numPageSets; ++set) {
         pagePLRUTable[set] = 0;
     }
+
+    // Initialize victim cache
+    numVictimCacheSets = victimCacheEntries / numAlignBanks;
+    victimCache.resize(numAlignBanks);
+    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
+        victimCache[bank].reserve(numVictimCacheSets);
+        for (unsigned set = 0; set < numVictimCacheSets; ++set) {
+            victimCache[bank].emplace_back(20, false);
+        }
+    }
+
+    victimCachePLRUTable.resize(numAlignBanks);
+    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
+        victimCachePLRUTable[bank] = 0;
+    }
+
 
     DPRINTF(BTBPDede, "BTBPDede initialized: numEntries %d, numWays %d, numSets %d, "
         "tagBits %d, tagFoldedBits %d, pageBits %d, numPageEntries %d, "
@@ -400,6 +417,14 @@ Addr BTBPDede::getMonitorTag(Addr pc)
     return tagLower | tagHigher;
 }
 
+Addr BTBPDede::getVictimCacheTag(Addr pc)
+{
+    unsigned fetchBlockWidth = floorLog2(predictWidth);
+    unsigned monitorSetWidth = floorLog2(numSets);
+    Addr fullTag = pc >> fetchBlockWidth;
+    return fullTag & mask(tagBits + monitorSetWidth);
+}
+
 std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
 {
     std::vector<MonitorSet> res(numAlignBanks);
@@ -444,12 +469,23 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
         unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
         auto &bank = monitorEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
-        for (unsigned way = 0; way < numWays; ++way) {
-            auto &entry = bank[way];
+        for (unsigned way = 0; way < numWays + numVictimCacheSets; ++way) {
+            MonitorEntry &entry =
+                (way < numWays) ? bank[way] : victimCache[phyBankIdx][way - numWays];
+
             Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
             if (!entry.valid) continue;
-            if (entry.tag != getMonitorTag(alignedAddr)) continue;
             if (branchPC < pc || branchPC >= (pc + predictWidth)) continue;
+            // if (entry.tag != getMonitorTag(alignedAddr)) continue;
+            if (entry.tag != (way < numWays ?
+                getMonitorTag(alignedAddr) :
+                getVictimCacheTag(alignedAddr))) continue;
+
+            DPRINTF(BTBPDede, "BTBPDede: use entry from %s way %d for bank %d alignedAddr %#lx\n",
+                (way < numWays) ? "monitor" : "victim cache",
+                (way < numWays) ? way : (way - numWays),
+                phyBankIdx,
+                alignedAddr);
 
             BTBEntry btbEntry;
             btbEntry.valid = true;
@@ -466,6 +502,20 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
                 btbEntry.pc, btbEntry.target);
             DPRINTF(BTBPDede, "BTBPDede: entry details - isCond %d, isIndirect %d, isCall %d, isReturn %d\n",
                 btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn);
+
+            if (way >= numWays) {
+                // update victim cache PLRU state
+                unsigned currentVictimPLRUState = victimCachePLRUTable[phyBankIdx];
+                unsigned touchedVictimPLRUState = getTouchedPLRUState(
+                    currentVictimPLRUState,
+                    numVictimCacheSets,
+                    way - numWays
+                );
+                victimCachePLRUTable[phyBankIdx] = touchedVictimPLRUState;
+                DPRINTF(BTBPDede, "BTBPDede: touched victim cache PLRU state for bank %d from %#x to %#x\n",
+                    phyBankIdx, currentVictimPLRUState, touchedVictimPLRUState);
+                continue;
+            }
 
             // update entry PLRU state
             Addr monitorIdx = getMonitorIdx(alignedAddr);
@@ -500,12 +550,22 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
         }
     );
 
-    if (btbEntries.size()) {
-        stats.predHitTimes++;
+    // prevent duplicate entries with same PC
+    // this should happen only when victim cache and monitor table
+    // both have entries for the same branch
+    auto last = std::unique(btbEntries.begin(), btbEntries.end(),
+        [](const BTBEntry &a, const BTBEntry &b) {
+            return a.pc == b.pc;
+        }
+    );
+    if (last != btbEntries.end()) {
+        DPRINTF(BTBPDede, "BTBPDede: removed %d duplicate BTB entries with same PC\n",
+            std::distance(last, btbEntries.end()));
     }
-    else {
-        stats.predMissTimes++;
-    }
+    btbEntries.erase(last, btbEntries.end());
+
+    if (btbEntries.size()) stats.predHitTimes++;
+    else stats.predMissTimes++;
 
     stats.predHitEntries += btbEntries.size();
 
@@ -665,6 +725,36 @@ unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &met
     }
     DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (PLRU) for pc %#lx\n",
         finalIdx, pc);
+
+    // put victim entry into victim cache
+    unsigned victimWay = getPLRUVictims(
+        victimCachePLRUTable[alignBankIdx],
+        numVictimCacheSets
+    )[0];
+    const MonitorEntry &toEvictEntry = meta[finalIdx];
+    MonitorEntry &victimEntry = victimCache[alignBankIdx][victimWay];
+
+    victimEntry = toEvictEntry;
+    victimEntry.tag = getVictimCacheTag(alignedPC);
+
+    DPRINTF(BTBPDede, "BTBPDede: victim entry details - position %d, tag %#lx, targetOffset %#lx, "
+        "isUsePagePointer %d, pagePointerWay %d, isCrossPage %d, carry %#x\n",
+        victimEntry.position, victimEntry.tag, victimEntry.targetOffset,
+        victimEntry.isUsePagePointer(), victimEntry.pagePointerWay,
+        victimEntry.isCrossPage, (int)victimEntry.carry.targetCarry);
+
+    DPRINTF(BTBPDede, "BTBPDede: evicted monitor entry to victim cache way %d for bank %d\n",
+        victimWay, alignBankIdx);
+
+    unsigned currentVictimPLRUState = victimCachePLRUTable[alignBankIdx];
+    unsigned touchedVictimPLRUState = getTouchedPLRUState(
+        currentVictimPLRUState,
+        numVictimCacheSets,
+        victimWay
+    );
+    victimCachePLRUTable[alignBankIdx] = touchedVictimPLRUState;
+    DPRINTF(BTBPDede, "BTBPDede: updated victim cache PLRU state for bank %d from %#x to %#x\n",
+        alignBankIdx, currentVictimPLRUState, touchedVictimPLRUState);
 
     return finalIdx;
 }

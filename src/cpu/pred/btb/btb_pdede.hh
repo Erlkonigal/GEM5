@@ -33,11 +33,13 @@ private:
     unsigned tagBits;
     unsigned tagFoldedBits;
     unsigned pageBits;
+    unsigned victimCacheEntries;
 
     unsigned numAlignBanks; // fixed to 2 banks
     unsigned numSets;
     unsigned numPageSets;
     unsigned numRegionSets;
+    unsigned numVictimCacheSets;
 
     // TODO: offset bits need profiling to decide
     const unsigned maxOffsetBits = 11;
@@ -130,14 +132,18 @@ private:
 
     std::shared_ptr<BTBPDedeMeta> meta;
 
-    // register implementation
-    std::vector<ReplacementAlignBank> monitorPLRUTable; // PLRU replacement table
-    std::vector<unsigned> pagePLRUTable;    // page table PLRU replacement table
-    std::vector<PageSet> pageTable;
-    // std::vector<RegionSet> regionTable; // TODO: implement region table
-
     // sram implementation
     std::vector<MonitorAlignBank> monitorTable;
+
+    // register implementation
+    std::vector<ReplacementAlignBank> monitorPLRUTable; // PLRU replacement table
+
+    std::vector<PageSet> pageTable;
+    std::vector<unsigned> pagePLRUTable;    // page table PLRU replacement table
+
+    std::vector<MonitorSet> victimCache;
+    std::vector<unsigned> victimCachePLRUTable;
+    // std::vector<RegionSet> regionTable; // TODO: implement region table
 
     unsigned getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx);
     Addr getFullTarget(Addr pc, const MonitorEntry &entry);
@@ -153,6 +159,8 @@ private:
 
     Addr getPageTableIdx(Addr target);
     Addr getPageTableTag(Addr target);
+
+    Addr getVictimCacheTag(Addr pc);
 
     std::vector<BTBEntry> processMonitorEntries(Addr pc, const std::vector<MonitorSet>& monitorSets);
     void fillStagePredictions(
