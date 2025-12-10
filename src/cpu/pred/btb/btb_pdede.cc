@@ -836,6 +836,29 @@ void BTBPDede::update(const FetchStream& stream) {
         break;
     }
 
+    // find entry already hit in victim cache
+    for (unsigned way = 0; way < numVictimCacheSets; ++way) {
+        auto &entry = victimCache[alignedBankIdx][way];
+        Addr monitorTag = getMonitorTag(exec.pc);
+        Addr monitorIdx = getMonitorIdx(exec.pc);
+        Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
+
+        if (!entry.valid) continue; // skip invalid entries
+        if (entry.position != alignedPosition) continue; // skip different position
+        if (entry.tag != victimTag) continue; // skip different tag
+
+        entry.targetOffset = (exec.target >> instShiftAmt) & mask(entry.getOffsetBits());
+        entry.carry = computeCarryBits(
+            exec.pc,
+            exec.target,
+            entry.getOffsetBits()
+        );
+        entry.attr = execAttr;
+
+        stats.updateHitVictimTimes++;
+        break;
+    }
+
     if (foundWay == -1) {
         stats.updateMissTimes++;
     }
@@ -969,6 +992,23 @@ void BTBPDede::update(const FetchStream& stream) {
      monitorPLRUTable[alignedBankIdx][monitorIdx] = newPLRUState;
     DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
         alignedBankIdx, monitorIdx, currentPLRUState, newPLRUState);
+
+
+    if (exec.isCond) {
+        stats.condAllocPartitionIdx.sample(partitionIdx);
+    }
+    if (exec.isUncond()) {
+        stats.uncondAllocPartitionIdx.sample(partitionIdx);
+    }
+    if (exec.isIndirect) {
+        stats.indirectAllocPartitionIdx.sample(partitionIdx);
+    }
+    if (exec.isCall) {
+        stats.callAllocPartitionIdx.sample(partitionIdx);
+    }
+    if (exec.isReturn) {
+        stats.returnAllocPartitionIdx.sample(partitionIdx);
+    }
 }
 
 void BTBPDede::printBTBEntry(const BTBEntry& e) {
@@ -1074,6 +1114,8 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(updateFoundEmptyTimes, statistics::units::Count::get(),"Number of update where an empty entry was found"),
     ADD_STAT(updateEvictTimes, statistics::units::Count::get(),"Number of update where an entry was evicted"),
     ADD_STAT(updateHitTimes, statistics::units::Count::get(), "Number of update hits"),
+    ADD_STAT(updateHitVictimTimes, statistics::units::Count::get(),
+        "Number of update hits from victim cache"),
     ADD_STAT(updateMultiHitTimes, statistics::units::Count::get(), "Number of update multi-hits"),
     ADD_STAT(updateUsePagePointerTimes, statistics::units::Count::get(),
         "Number of updates using page pointer"),
@@ -1104,13 +1146,29 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(callTargetDiffBits, statistics::units::Count::get(),
         "Target difference bits for call branch updates"),
     ADD_STAT(returnTargetDiffBits, statistics::units::Count::get(),
-        "Target difference bits for return branch updates")
+        "Target difference bits for return branch updates"),
+    ADD_STAT(condAllocPartitionIdx, statistics::units::Count::get(),
+        "Partition index allocated for conditional branch updates"),
+    ADD_STAT(uncondAllocPartitionIdx, statistics::units::Count::get(),
+        "Partition index allocated for unconditional branch updates"),
+    ADD_STAT(indirectAllocPartitionIdx, statistics::units::Count::get(),
+        "Partition index allocated for indirect branch updates"),
+    ADD_STAT(callAllocPartitionIdx, statistics::units::Count::get(),
+        "Partition index allocated for call branch updates"),
+    ADD_STAT(returnAllocPartitionIdx, statistics::units::Count::get(),
+        "Partition index allocated for return branch updates")
 {
     condTargetDiffBits.init(0, 64, 1);
     uncondTargetDiffBits.init(0, 64, 1);
     indirectTargetDiffBits.init(0, 64, 1);
     callTargetDiffBits.init(0, 64, 1);
     returnTargetDiffBits.init(0, 64, 1);
+
+    condAllocPartitionIdx.init(0, 8, 1);
+    uncondAllocPartitionIdx.init(0, 8, 1);
+    indirectAllocPartitionIdx.init(0, 8, 1);
+    callAllocPartitionIdx.init(0, 8, 1);
+    returnAllocPartitionIdx.init(0, 8, 1);
 }
 
 

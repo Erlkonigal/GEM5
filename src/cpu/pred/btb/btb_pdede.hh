@@ -193,6 +193,7 @@ private:
         Scalar updateEvictTimes;
 
         Scalar updateHitTimes;
+        Scalar updateHitVictimTimes;
         Scalar updateMultiHitTimes;
 
         Scalar updateUsePagePointerTimes;
@@ -223,6 +224,12 @@ private:
         statistics::Distribution indirectTargetDiffBits;
         statistics::Distribution callTargetDiffBits;
         statistics::Distribution returnTargetDiffBits;
+
+        statistics::Distribution condAllocPartitionIdx;
+        statistics::Distribution uncondAllocPartitionIdx;
+        statistics::Distribution indirectAllocPartitionIdx;
+        statistics::Distribution callAllocPartitionIdx;
+        statistics::Distribution returnAllocPartitionIdx;
 
         PDedeStats(statistics::Group* parent);
     } stats;
