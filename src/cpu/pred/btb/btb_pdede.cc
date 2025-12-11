@@ -885,6 +885,7 @@ void BTBPDede::update(const FetchStream& stream) {
 
         entry.valid = false; // invalidate the victim cache entry after hit
         if (foundVictimWay == -1) {
+            foundVictimWay = way;
             entry.valid = true;
             entry.targetOffset = (exec.target >> instShiftAmt) & mask(entry.getOffsetBits());
             entry.carry = computeCarryBits(
@@ -897,11 +898,12 @@ void BTBPDede::update(const FetchStream& stream) {
         }
     }
 
+    // if found in monitor table but not in the chosen partition
+    // invalidate the found entry
     if (foundWay != partitionIdx && foundWay != -1) {
         DPRINTF(BTBPDede, "BTBPDede: found existing monitor entry in way %d, need to invalid\n",
             foundWay);
         stats.updateMultiHitTimes++;
-        // invalidate the found entry
         toUpdate[foundWay].valid = false;
         // update PLRU state
         // foundWay should be replaced as soon as possible
