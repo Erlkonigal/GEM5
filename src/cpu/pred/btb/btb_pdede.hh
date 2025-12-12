@@ -42,19 +42,7 @@ private:
     unsigned numVictimCacheSets;
 
     // TODO: offset bits need profiling to decide
-    const unsigned maxOffsetBits = 11;
-
-    // const std::vector<unsigned> way4OffsetBits = {11, 11, maxOffsetBits, maxOffsetBits};
-    // const std::vector<bool> way4UsePagePointer = {false, false, true, true};
-    const std::vector<unsigned> way4OffsetBits = {maxOffsetBits, maxOffsetBits, maxOffsetBits, maxOffsetBits};
-    const std::vector<bool> way4UsePagePointer = {true, true, true, true};
-
-    const std::vector<unsigned> way8OffsetBits = {0, 4, 5, 7, 9, 11, maxOffsetBits, maxOffsetBits};
-    const std::vector<bool> way8UsePagePointer = {false, false, false, false,
-                                                  false, false, true, true};
-
-    std::vector<unsigned> wayOffsetBits;
-    std::vector<bool> wayUsePagePointer;
+    static constexpr unsigned maxOffsetBits = 11;
 
     struct BranchAttribute
     {
@@ -100,10 +88,17 @@ private:
         unsigned position; // position in the fetch block
         Addr tag;
         Addr targetOffset; // target low bits
-        // Addr pagePointerSet;
-        Addr pagePointerWay;
-        TargetCarry carry;
         BranchAttribute attr;
+        TargetCarry carry;
+
+        union ExtInfo
+        {
+            Addr pageTableWay; // used as long target with page pointer
+            unsigned ctr;        // used as conditional short target prediction counter
+        } extendedInfo;
+
+
+        MonitorEntry() : offsetBits(maxOffsetBits), usePagePointer(true), valid(false) {}
         MonitorEntry(int offsetBits, bool usePagePointer)
             : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false) {}
 
@@ -174,8 +169,8 @@ private:
         std::vector<FullBTBPrediction>& stagePreds
     );
 
-    unsigned getTargetDiffBits(Addr pc, Addr target);
-    unsigned getPartitionIdx(const BranchInfo &exec, const MonitorSet &meta);
+    // unsigned getTargetDiffBits(Addr pc, Addr target);
+    // unsigned getPartitionIdx(const BranchInfo &exec, const MonitorSet &meta);
 
     void printBTBEntry(const BTBEntry& e);
     void dumpBTBEntries(const std::vector<BTBEntry>& es);
@@ -227,17 +222,17 @@ private:
         Scalar returnHits;
         Scalar returnMisses;
 
-        statistics::Distribution condTargetDiffBits;
-        statistics::Distribution uncondTargetDiffBits;
-        statistics::Distribution indirectTargetDiffBits;
-        statistics::Distribution callTargetDiffBits;
-        statistics::Distribution returnTargetDiffBits;
+        // statistics::Distribution condTargetDiffBits;
+        // statistics::Distribution uncondTargetDiffBits;
+        // statistics::Distribution indirectTargetDiffBits;
+        // statistics::Distribution callTargetDiffBits;
+        // statistics::Distribution returnTargetDiffBits;
 
-        statistics::Distribution condAllocPartitionIdx;
-        statistics::Distribution uncondAllocPartitionIdx;
-        statistics::Distribution indirectAllocPartitionIdx;
-        statistics::Distribution callAllocPartitionIdx;
-        statistics::Distribution returnAllocPartitionIdx;
+        // statistics::Distribution condAllocPartitionIdx;
+        // statistics::Distribution uncondAllocPartitionIdx;
+        // statistics::Distribution indirectAllocPartitionIdx;
+        // statistics::Distribution callAllocPartitionIdx;
+        // statistics::Distribution returnAllocPartitionIdx;
 
         PDedeStats(statistics::Group* parent);
     } stats;

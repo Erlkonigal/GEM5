@@ -23,17 +23,10 @@ BTBPDede::BTBPDede(const Params& p):
     /*
         Totally 8192 entries
         Monitor table: 2 Align Banks
-            // Solution 1
-            each bank has 4096 entries
-            each entry has 4 ways, 1024 entries per way
-            for way 0 to way 1, offset bits are 11, 11,
-            for way 2 to way 3, offset bits are 11, with PagePointer
 
-            // Solution 2
             each bank has 4096 entries
-            each entry has 8 ways, 512 entries per way
-            for way 0 to way 6, offset bits are 0, 4, 5, 7, 9, 11,
-            for way 6 to way 7, offset bits are 11, with PagePointer
+            each entry has numWay ways, 4096/numWay entries per way
+            for way 0 to way numWay-1, offset bits are 11, with PagePointer
 
         Page table:
             2 align banks use the same page table, totally 512 entries
@@ -48,16 +41,6 @@ BTBPDede::BTBPDede(const Params& p):
 
     numAlignBanks = predictWidth / blockSize; // 2 align banks
 
-    assert(numWays == 4 || numWays == 8);
-
-    if (numWays == 4) {
-        wayOffsetBits = way4OffsetBits;
-        wayUsePagePointer = way4UsePagePointer;
-    } else if (numWays == 8) {
-        wayOffsetBits = way8OffsetBits;
-        wayUsePagePointer = way8UsePagePointer;
-    }
-
     // Initialize monitor table
     numSets = numEntries / (numWays * numAlignBanks);
     monitorTable.resize(numAlignBanks);
@@ -66,8 +49,7 @@ BTBPDede::BTBPDede(const Params& p):
         for (unsigned set = 0; set < numSets; ++set) {
             monitorTable[bank][set].reserve(numWays);
             for (unsigned way = 0; way < numWays; ++way) {
-                monitorTable[bank][set].emplace_back(
-                    wayOffsetBits[way], wayUsePagePointer[way]);
+                monitorTable[bank][set].emplace_back();
             }
         }
     }
@@ -143,7 +125,7 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr targetLower = entry.targetOffset << instShiftAmt;
 
     const auto &pageEntry =
-        pageTable[getPageTableIdx(targetLower)][entry.pagePointerWay];
+        pageTable[getPageTableIdx(targetLower)][entry.extendedInfo.pageTableWay];
 
     Addr fullTarget = 0;
     TargetCarry carry = entry.carry;
@@ -169,30 +151,30 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
             fullTarget = pcUpperMinusOne | pageSection | targetLower;
         }
         else {
-            fullTarget = targetLower; // invalid target
+            fullTarget = pageSection | targetLower; // invalid target
         }
     }
-    else if (entry.isUsePagePointer()) {
-        // we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
-        pcMiddle = pc & ~mask(floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt);
-        pcMiddlePlusOne = pcMiddle + (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
-        pcMiddleMinusOne = pcMiddle - (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
+    // else if (entry.isUsePagePointer()) {
+    //     // we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
+    //     pcMiddle = pc & ~mask(floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt);
+    //     pcMiddlePlusOne = pcMiddle + (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
+    //     pcMiddleMinusOne = pcMiddle - (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
 
-        Addr pageSection = entry.pagePointerWay << (maxOffsetBits + instShiftAmt);
+    //     Addr pageSection = entry.pagePointerWay << (maxOffsetBits + instShiftAmt);
 
-        if (carry.isFit()) {
-            fullTarget = pcMiddle | pageSection | targetLower;
-        }
-        else if (carry.isPlusOne()) {
-            fullTarget = pcMiddlePlusOne | pageSection | targetLower;
-        }
-        else if (carry.isMinusOne()){
-            fullTarget = pcMiddleMinusOne | pageSection | targetLower;
-        }
-        else {
-            fullTarget = targetLower; // invalid target
-        }
-    }
+    //     if (carry.isFit()) {
+    //         fullTarget = pcMiddle | pageSection | targetLower;
+    //     }
+    //     else if (carry.isPlusOne()) {
+    //         fullTarget = pcMiddlePlusOne | pageSection | targetLower;
+    //     }
+    //     else if (carry.isMinusOne()){
+    //         fullTarget = pcMiddleMinusOne | pageSection | targetLower;
+    //     }
+    //     else {
+    //         fullTarget = pageSection | targetLower; // invalid target
+    //     }
+    // }
     else {
         if (carry.isFit()) {
             fullTarget = pcMiddle | targetLower;
@@ -468,6 +450,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
         auto &bank = monitorEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
         bool foundInVictimCache = false;
+
         for (unsigned way = 0; way < numWays + numVictimCacheSets; ++way) {
             MonitorEntry &entry =
                 (way < numWays) ? bank[way] : victimCache[phyBankIdx][way - numWays];
@@ -540,7 +523,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
                 unsigned touchedPagePLRUState = getTouchedPLRUState(
                     currentPagePLRUState,
                     numPageWays,
-                    entry.pagePointerWay
+                    entry.extendedInfo.pageTableWay
                 );
                 pagePLRUTable[pageTableIdx] = touchedPagePLRUState;
                 DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
@@ -560,32 +543,30 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
         }
     );
 
-    // prevent duplicate entries with same PC
-    // this should happen only when victim cache and monitor table
-    // both have entries for the same branch
-    auto last = std::unique(btbEntries.begin(), btbEntries.end(),
-        [](const BTBEntry &a, const BTBEntry &b) {
-            return a.pc == b.pc;
-        }
-    );
-    if (last != btbEntries.end()) {
-        DPRINTF(BTBPDede, "BTBPDede: removed %d duplicate BTB entries with same PC\n",
-            std::distance(last, btbEntries.end()));
-    }
-    btbEntries.erase(last, btbEntries.end());
+    // // prevent duplicate entries with same PC
+    // // this should happen only when victim cache and monitor table
+    // // both have entries for the same branch
+    // auto last = std::unique(btbEntries.begin(), btbEntries.end(),
+    //     [](const BTBEntry &a, const BTBEntry &b) {
+    //         return a.pc == b.pc;
+    //     }
+    // );
+    // if (last != btbEntries.end()) {
+    //     DPRINTF(BTBPDede, "BTBPDede: removed %d duplicate BTB entries with same PC\n",
+    //         std::distance(last, btbEntries.end()));
+    // }
+    // btbEntries.erase(last, btbEntries.end());
 
     if (btbEntries.size()) stats.predHitTimes++;
     else stats.predMissTimes++;
 
     stats.predHitEntries += btbEntries.size();
 
-
     BTBPDedeMeta newMeta;
     newMeta.rawMonitorSets = originEntries;
     newMeta.btbEntries = btbEntries;
 
     meta = std::make_shared<BTBPDedeMeta>(newMeta);
-
 
     return btbEntries;
 }
@@ -669,142 +650,7 @@ void BTBPDede::putPCHistory(
     fillStagePredictions(processed_entries, stagePreds);
 }
 
-unsigned BTBPDede::getTargetDiffBits(Addr pc, Addr target) {
-    Addr diff = (pc >> instShiftAmt) ^ (target >> instShiftAmt);
-    unsigned diffBits = 0;
-    while (diff != 0) {
-        diffBits++;
-        diff = diff >> 1;
-    }
-    return diffBits;
-}
-
-unsigned BTBPDede::getPartitionIdx(const BranchInfo &exec, const MonitorSet &meta) {
-    Addr pc = exec.pc;
-    Addr target = exec.target;
-    bool isReturn = exec.isReturn;
-
-    DPRINTF(BTBPDede, "BTBPDede: getPartitionIdx called for pc %#lx target %#lx isReturn %d\n",
-        pc, target, isReturn);
-
-    Addr alignedPC = pc & ~(blockSize - 1);
-    unsigned alignBankIdx = getRotatedAlignBankIdx(pc, 0);
-
-    auto getSmallestPartitionIdx = [this](unsigned diffBits) -> unsigned {
-        for (unsigned i = 0; i < wayOffsetBits.size(); ++i) {
-            if (diffBits <= wayOffsetBits[i]) {
-                return i;
-            }
-            else if (wayUsePagePointer[i]) {
-                return i;
-            }
-        }
-        return wayOffsetBits.size() - 1;
-    };
-
-    unsigned diffBits = getTargetDiffBits(pc, target);
-    unsigned startIdx = getSmallestPartitionIdx(diffBits);
-    unsigned finalIdx = startIdx;
-    bool foundEmpty = false;
-    for (unsigned i = startIdx; i < wayOffsetBits.size(); ++i) {
-        // choose the first way that is empty
-        if (!meta[i].valid) {
-            finalIdx = i;
-            foundEmpty = true;
-            break;
-        }
-    }
-    DPRINTF(BTBPDede, "BTBPDede: getPartitionIdx computed diffBits %d startIdx %d\n",
-        diffBits, startIdx);
-    /* if !foundEmpty, we use PLRU to choose the way;
-     * NOTE: in this case, PLRU will give numWay victims,
-     *       so we need to filter the ways that are smaller than startIdx,
-     *       and choose the first one among the rest.
-     */
-    if (foundEmpty) {
-        stats.updateFoundEmptyTimes++;
-        DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (empty) for pc %#lx\n",
-            finalIdx, pc);
-        return finalIdx;
-    }
-    stats.updateEvictTimes++;
-    auto monitorIdx = getMonitorIdx(alignedPC);
-    auto plruState = monitorPLRUTable[alignBankIdx][monitorIdx];
-    auto plruVictims = getPLRUVictims(plruState, numWays);
-
-    // Solution 1: choose first PLRU victim that is >= startIdx
-    // for (auto way : plruVictims) {
-    //     if (way >= startIdx) {
-    //         finalIdx = way;
-    //         break;
-    //     }
-    // }
-    // for (auto way : plruVictims) {
-    //     DPRINTF(BTBPDede, "BTBPDede: PLRU victim way %d\n", way);
-    // }
-
-    // Solution 2: directly choose the first PLRU victim
-    finalIdx = plruVictims[0]; // choose the first PLRU victim directly
-
-    DPRINTF(BTBPDede, "BTBPDede: chosen partitionIdx %d (PLRU) for pc %#lx\n",
-        finalIdx, pc);
-
-    if (victimCacheEntries == 0) return finalIdx; // no victim cache configured
-
-    // put victim entry into victim cache
-
-    // firstly find invalid entry in victim cache
-    unsigned victimWay = -1;
-    for (unsigned way = 0; way < numVictimCacheSets; ++way) {
-        auto &entry = victimCache[alignBankIdx][way];
-        if (!entry.valid) {
-            victimWay = way;
-            // stats.updateVictimCacheFoundEmptyTimes++;
-            DPRINTF(BTBPDede, "BTBPDede: found empty victim cache way %d for bank %d\n",
-                victimWay, alignBankIdx);
-            break;
-        }
-    }
-
-    if (victimWay == -1) {
-        // no empty entry, use victim cache PLRU to choose victim
-        victimWay = getPLRUVictims(
-            victimCachePLRUTable[alignBankIdx],
-            numVictimCacheSets
-        )[0];
-    }
-
-    const MonitorEntry &toEvictEntry = meta[finalIdx];
-    MonitorEntry &victimEntry = victimCache[alignBankIdx][victimWay];
-
-    victimEntry = toEvictEntry;
-    victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
-
-    DPRINTF(BTBPDede, "BTBPDede: victim entry details - position %d, tag %#lx, targetOffset %#lx, "
-        "isUsePagePointer %d, pagePointerWay %d, isCrossPage %d, carry %#x\n",
-        victimEntry.position, victimEntry.tag, victimEntry.targetOffset,
-        victimEntry.isUsePagePointer(), victimEntry.pagePointerWay,
-        victimEntry.isCrossPage, (int)victimEntry.carry.targetCarry);
-
-    DPRINTF(BTBPDede, "BTBPDede: evicted monitor entry to victim cache way %d for bank %d\n",
-        victimWay, alignBankIdx);
-
-    unsigned currentVictimPLRUState = victimCachePLRUTable[alignBankIdx];
-    unsigned touchedVictimPLRUState = getTouchedPLRUState(
-        currentVictimPLRUState,
-        numVictimCacheSets,
-        victimWay
-    );
-    victimCachePLRUTable[alignBankIdx] = touchedVictimPLRUState;
-    DPRINTF(BTBPDede, "BTBPDede: updated victim cache PLRU state for bank %d from %#x to %#x\n",
-        alignBankIdx, currentVictimPLRUState, touchedVictimPLRUState);
-
-    return finalIdx;
-}
-
 void BTBPDede::update(const FetchStream& stream) {
-    static uint64_t lastUpdateTick;
-
     DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
 
     if (stream.squashType != SQUASH_CTRL) {
@@ -816,13 +662,7 @@ void BTBPDede::update(const FetchStream& stream) {
         return;
     }
 
-    // if (lastUpdateTick == stream.predTick) {
-    //     DPRINTF(BTBPDede, "BTBPDede: update skipped due to already updated in this prediction tick\n");
-    //     return;
-    // }
-
     stats.updateTimes++;
-    lastUpdateTick = stream.predTick;
 
     auto metaFromUpdate =
         std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
@@ -830,12 +670,11 @@ void BTBPDede::update(const FetchStream& stream) {
     BranchInfo exec = stream.exeBranchInfo;
     unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
     unsigned monitorIdx = getMonitorIdx(exec.pc);
+    unsigned monitorTag = getMonitorTag(exec.pc);
+    unsigned pageTableIdx = getPageTableIdx(exec.target);
+    unsigned pageTableTag = getPageTableTag(exec.target);
     unsigned alignedPosition = (exec.pc & (blockSize - 1)) >> instShiftAmt;
 
-
-    // MonitorSet toUpdate = metaFromUpdate->rawMonitorSets[alignedBankIdx];
-
-    // ideal entries from current monitor table
     auto &toUpdate = monitorTable[alignedBankIdx][monitorIdx];
 
     BranchAttribute execAttr({
@@ -847,207 +686,232 @@ void BTBPDede::update(const FetchStream& stream) {
                 BranchAttribute::RasActionEnum::None)
     });
 
-    unsigned targetDiffBits = getTargetDiffBits(exec.pc, exec.target);
-
-    // unsigned partitionIdx = getPartitionIdx(exec, metaFromUpdate);
-
-    // ideal meta from current monitor table
-    unsigned partitionIdx = getPartitionIdx(exec, toUpdate);
-
-    bool usePagePointer = wayUsePagePointer[partitionIdx];
-
     // find entry already hit in monitor table
     unsigned foundWay = -1;
     for (unsigned way = 0; way < numWays; ++way) {
         auto &entry = toUpdate[way];
         if (!entry.valid) continue; // skip invalid entries
         if (entry.position != alignedPosition) continue; // skip different position
-        if (entry.tag != getMonitorTag(exec.pc)) continue; // skip different tag
+        if (entry.tag != monitorTag) continue; // skip different tag
 
-        entry.valid = false; // invalidate the monitor entry after hit
-        if (foundWay == -1) {
-            foundWay = way;
-            stats.updateHitTimes++;
-        }
+        foundWay = way;
+        stats.updateHitTimes++;
+        break;
     }
 
     // find entry already hit in victim cache
     unsigned foundVictimWay = -1;
     for (unsigned way = 0; way < numVictimCacheSets; ++way) {
         auto &entry = victimCache[alignedBankIdx][way];
-        Addr monitorTag = getMonitorTag(exec.pc);
-        Addr monitorIdx = getMonitorIdx(exec.pc);
         Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
 
         if (!entry.valid) continue; // skip invalid entries
         if (entry.position != alignedPosition) continue; // skip different position
         if (entry.tag != victimTag) continue; // skip different tag
 
-        entry.valid = false; // invalidate the victim cache entry after hit
-        if (foundVictimWay == -1) {
-            foundVictimWay = way;
-            entry.valid = true;
-            entry.targetOffset = (exec.target >> instShiftAmt) & mask(entry.getOffsetBits());
-            entry.carry = computeCarryBits(
-                exec.pc,
-                exec.target,
-                entry.getOffsetBits()
-            );
-            entry.attr = execAttr;
-            stats.updateHitVictimTimes++;
-        }
+        foundVictimWay = way;
+        stats.updateHitVictimTimes++;
+        break;
     }
 
-    // if found in monitor table but not in the chosen partition
-    // invalidate the found entry
-    if (foundWay != partitionIdx && foundWay != -1) {
-        DPRINTF(BTBPDede, "BTBPDede: found existing monitor entry in way %d, need to invalid\n",
-            foundWay);
-        stats.updateMultiHitTimes++;
-        toUpdate[foundWay].valid = false;
-        // update PLRU state
-        // foundWay should be replaced as soon as possible
-        // so we set it as the most recently used entry
-        auto currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
-        auto newPLRUState = getMakeVictimPLRUState(
+    // helper functions for update
+    auto updateMonitorPLRUState = [&] (unsigned way) {
+        unsigned currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
+        unsigned touchedPLRUState = getTouchedPLRUState(
             currentPLRUState,
             numWays,
-            foundWay
+            way
         );
-        monitorPLRUTable[alignedBankIdx][monitorIdx] = newPLRUState;
-        DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
-            alignedBankIdx, monitorIdx, currentPLRUState, newPLRUState);
-    }
-    else if (foundWay == -1 && foundVictimWay == -1) {
-        stats.updateMissTimes++;
-    }
+        monitorPLRUTable[alignedBankIdx][monitorIdx] = touchedPLRUState;
+        DPRINTF(BTBPDede, "BTBPDede: touched monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
+            alignedBankIdx, monitorIdx, currentPLRUState, touchedPLRUState);
+    };
 
-    MonitorEntry &monitorEntry = toUpdate[partitionIdx];
+    auto updatePagePLRUState = [&](unsigned way) {
+        unsigned currentPLRUState = pagePLRUTable[pageTableIdx];
+        unsigned touchedPLRUState = getTouchedPLRUState(
+            currentPLRUState,
+            numPageWays,
+            way
+        );
+        pagePLRUTable[pageTableIdx] = touchedPLRUState;
+        DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
+            pageTableIdx, currentPLRUState, touchedPLRUState);
+    };
 
-    // Update monitor entry
-    monitorEntry.valid = true;
-    monitorEntry.position = alignedPosition;
-    monitorEntry.tag = getMonitorTag(exec.pc);
-    monitorEntry.targetOffset = (exec.target >> instShiftAmt) & mask(monitorEntry.getOffsetBits());
-    if (usePagePointer && (targetDiffBits > maxOffsetBits + floorLog2(numPageWays))) {
-        DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update\n");
+    auto updateVictimCachePLRUState = [&](unsigned way) {
+        unsigned currentVictimPLRUState = victimCachePLRUTable[alignedBankIdx];
+        unsigned touchedVictimPLRUState = getTouchedPLRUState(
+            currentVictimPLRUState,
+            numVictimCacheSets,
+            way
+        );
+        victimCachePLRUTable[alignedBankIdx] = touchedVictimPLRUState;
+        DPRINTF(BTBPDede, "BTBPDede: touched victim cache PLRU state for bank %d from %#x to %#x\n",
+            alignedBankIdx, currentVictimPLRUState, touchedVictimPLRUState);
+    };
+
+    // build new entry
+    TargetCarry shortCarry = computeCarryBits(
+        exec.pc,
+        exec.target,
+        maxOffsetBits
+    );
+    TargetCarry longCarry = computeCarryBits(
+        exec.pc,
+        exec.target,
+        maxOffsetBits + pageBits
+    );
+
+    bool isCrossPage = shortCarry.isNone();
+
+    MonitorEntry newEntry;
+    newEntry.valid = true;
+    newEntry.isCrossPage = isCrossPage;
+    newEntry.position = alignedPosition;
+    newEntry.tag = monitorTag;
+    newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
+    newEntry.attr = execAttr;
+    newEntry.carry = (isCrossPage) ? longCarry : shortCarry;
+
+    // compute extended info
+    if (isCrossPage) {
         stats.updateUsePagePointerTimes++;
 
-        Addr pagePointerSet = getPageTableIdx(exec.target);
         // check if page entry exists
-        Addr pagePointerWay = 0;
-        bool pageEntryExists = false;
+        Addr pageTableWay = -1;
         for (unsigned way = 0; way < numPageWays; ++way) {
-            auto &pageEntry = pageTable[pagePointerSet][way];
-            Addr newTag = getPageTableTag(exec.target);
+            auto &pageEntry = pageTable[pageTableIdx][way];
             Addr entryTag = pageEntry.tag;
-            if (entryTag == newTag) {
-                pagePointerWay = way;
-                pageEntryExists = true;
+            if (entryTag != pageTableTag) continue;
+
+            pageTableWay = way;
+            break;
+        }
+        // page entry not exists
+        if (pageTableWay == -1) {
+            stats.updateAllocatePagePointerTimes++;
+
+            // choose victim way using PLRU
+            pageTableWay = getPLRUVictims(
+                pagePLRUTable[pageTableIdx],
+                numPageWays
+            )[0];
+
+            // update page entry
+            auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
+            pageEntry.tag = getPageTableTag(exec.target);
+
+            DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
+                pageTableIdx, pageTableWay);
+            DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
+            printPageEntry(pageEntry);
+        }
+
+        newEntry.extendedInfo.pageTableWay = pageTableWay;
+        updatePagePLRUState(pageTableWay);
+    }
+    else {
+        // TODO: add saturated counter update logic
+    }
+
+    if (foundWay != -1) {
+        toUpdate[foundWay] = newEntry;
+
+        DPRINTF(BTBPDede, "BTBPDede: updated existing monitor entry at bank %d, index %d, way %d\n",
+            alignedBankIdx, monitorIdx, foundWay);
+
+        updateMonitorPLRUState(foundWay);
+
+        // deduplicate victim cache if foundVictimWay also hits
+        if (foundVictimWay != -1) {
+            DPRINTF(BTBPDede, "BTBPDede: deduplicating victim cache entry at bank %d, way %d\n",
+                alignedBankIdx, foundVictimWay);
+            victimCache[alignedBankIdx][foundVictimWay].valid = false;
+        }
+    }
+    else if (foundVictimWay != -1) {
+        // in-place update existing victim cache entry
+        auto &victimEntry = victimCache[alignedBankIdx][foundVictimWay];
+        victimEntry = newEntry;
+        victimEntry.tag = getVictimCacheTag(monitorTag, monitorIdx);
+
+        updateVictimCachePLRUState(foundVictimWay);
+
+        DPRINTF(BTBPDede, "BTBPDede: updated existing victim cache entry at bank %d, way %d\n",
+            alignedBankIdx, foundVictimWay);
+    }
+    else {
+        // need to allocate new entry
+        stats.updateMissTimes++;
+
+        unsigned evictWay = -1;
+
+        // first try to find invalid entry
+        for (unsigned i = 0; i < numWays; ++i) {
+            auto &entry = toUpdate[i];
+            if (!entry.valid) {
+                evictWay = i;
+                DPRINTF(BTBPDede, "BTBPDede: found empty way %d for bank %d idx %#lx\n",
+                    evictWay, alignedBankIdx, monitorIdx);
                 break;
             }
         }
 
-        monitorEntry.isCrossPage = true;
-        if (pageEntryExists) {
-            DPRINTF(BTBPDede, "BTBPDede: page entry exists in way %d\n", pagePointerWay);
-            monitorEntry.pagePointerWay = pagePointerWay;
-        }
-        else {
-            DPRINTF(BTBPDede, "BTBPDede: page entry does not exist, allocating new entry\n");
-            stats.updateAllocatePagePointerTimes++;
-            // choose victim way using PLRU
-            auto plruState = pagePLRUTable[pagePointerSet];
-            auto plruVictims = getPLRUVictims(plruState, numPageWays);
-            pagePointerWay = plruVictims[0]; // choose the first victim
-            monitorEntry.pagePointerWay = pagePointerWay;
+        if (evictWay == -1) {
+            stats.updateEvictTimes++;
+            // no invalid entry, use PLRU to choose victim
+            evictWay = getPLRUVictims(
+                monitorPLRUTable[alignedBankIdx][monitorIdx],
+                numWays
+            )[0];
 
-            // update page entry
-            DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
-                pagePointerSet, pagePointerWay);
-            auto &pageEntry = pageTable[pagePointerSet][pagePointerWay];
-            pageEntry.tag = getPageTableTag(exec.target);
-            DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
-            printPageEntry(pageEntry);
+            updateMonitorPLRUState(evictWay);
 
-            // update monitor entry carry bits
-            monitorEntry.carry = computeCarryBits(
-                exec.pc,
-                exec.target,
-                maxOffsetBits + pageBits
-            );
+            DPRINTF(BTBPDede, "BTBPDede: evicting way %d for bank %d idx %#lx\n",
+                evictWay, alignedBankIdx, monitorIdx);
         }
 
-        // update page PLRU state
-        unsigned currentPLRUState = pagePLRUTable[pagePointerSet];
-        unsigned touchedPLRUState = getTouchedPLRUState(
-            currentPLRUState,
-            numPageWays,
-            pagePointerWay
-        );
-        pagePLRUTable[pagePointerSet] = touchedPLRUState;
-        DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
-            pagePointerSet, currentPLRUState, touchedPLRUState);
-    }
-    else if (usePagePointer && (targetDiffBits <= maxOffsetBits + floorLog2(numPageWays))) {
-        DPRINTF(BTBPDede, "BTBPDede: using page pointer for monitor entry update (not cross page)\n");
-        stats.updateNotUseButHasPagePointerTimes++;
+        const auto &toEvictEntry = toUpdate[evictWay];
 
-        monitorEntry.isCrossPage = false;
-        monitorEntry.pagePointerWay = (exec.target >> (maxOffsetBits + instShiftAmt)) & mask(floorLog2(numPageWays));
+        // evict to victim cache
+        if (toEvictEntry.valid && victimCacheEntries != 0) {
+            // insert evicted entry into victim cache
+            unsigned victimWay = -1;
+            for (unsigned way = 0; way < numVictimCacheSets; way++) {
+                auto &victimEntry = victimCache[alignedBankIdx][way];
+                // find invalid entry first
+                if (!victimEntry.valid) {
+                    victimWay = way;
+                    DPRINTF(BTBPDede, "BTBPDede: found empty victim cache way %d for bank %d\n",
+                        victimWay, alignedBankIdx);
+                    break;
+                }
+                if (victimEntry.tag != getVictimCacheTag(toEvictEntry.tag, monitorIdx)) continue;
+                if (victimEntry.position != toEvictEntry.position) continue;
+                // update existing entry in victim cache
+                victimWay = way;
+                break;
+            }
 
-        monitorEntry.carry = computeCarryBits(
-            exec.pc,
-            exec.target,
-            maxOffsetBits + floorLog2(numPageWays)
-        );
-        monitorEntry.attr = execAttr;
-    }
-    else {
-        DPRINTF(BTBPDede, "BTBPDede: not using page pointer for monitor entry update\n");
-        stats.updateNotUseAndNoPagePointerTimes++;
-        monitorEntry.carry = computeCarryBits(
-            exec.pc,
-            exec.target,
-            monitorEntry.getOffsetBits()
-        );
-        monitorEntry.attr = execAttr;
-    }
+            if (victimWay == -1) {
+                // no invalid entry, use victim cache PLRU to choose victim
+                victimWay = getPLRUVictims(
+                    victimCachePLRUTable[alignedBankIdx],
+                    numVictimCacheSets
+                )[0];
+                DPRINTF(BTBPDede, "BTBPDede: evicting victim cache way %d for bank %d\n",
+                    victimWay, alignedBankIdx);
 
-    DPRINTF(BTBPDede, "BTBPDede: updated monitor entry at bank %d, index %d, way %d\n",
-        alignedBankIdx, monitorIdx, partitionIdx);
+                updateVictimCachePLRUState(victimWay);
+            }
 
-    DPRINTF(BTBPDede, "BTBPDede: updated monitor entry details:\n");
-    printMonitorEntry(monitorEntry);
+            auto &victimEntry = victimCache[alignedBankIdx][victimWay];
+            victimEntry = toEvictEntry;
+            victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
+        }
 
-    // monitorTable[alignedBankIdx][monitorIdx] = toUpdate;
-
-    // update monitor PLRU state
-    auto currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
-    auto newPLRUState = getTouchedPLRUState(
-        currentPLRUState,
-        numWays,
-        partitionIdx
-    );
-     monitorPLRUTable[alignedBankIdx][monitorIdx] = newPLRUState;
-    DPRINTF(BTBPDede, "BTBPDede: updated monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
-        alignedBankIdx, monitorIdx, currentPLRUState, newPLRUState);
-
-
-    if (exec.isCond) {
-        stats.condAllocPartitionIdx.sample(partitionIdx);
-    }
-    if (exec.isUncond()) {
-        stats.uncondAllocPartitionIdx.sample(partitionIdx);
-    }
-    if (exec.isIndirect) {
-        stats.indirectAllocPartitionIdx.sample(partitionIdx);
-    }
-    if (exec.isCall) {
-        stats.callAllocPartitionIdx.sample(partitionIdx);
-    }
-    if (exec.isReturn) {
-        stats.returnAllocPartitionIdx.sample(partitionIdx);
+        toUpdate[evictWay] = newEntry;
     }
 }
 
@@ -1069,10 +933,10 @@ void BTBPDede::dumpBTBEntries(const std::vector<BTBEntry>& es) {
 void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
     DPRINTF(BTBPDede, "MonitorEntry: offsetBits:%d, usePagePointer:%d, valid:%d, isCrossPage:%d, "
         "position:%d, tag:%#lx, targetOffset:%#lx, pagePointerSet:%#lx, "
-        "pagePointerWay:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
+        "extInfo:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
         e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
         e.position, e.tag, e.targetOffset, getPageTableIdx(e.targetOffset << instShiftAmt),
-        e.pagePointerWay, (int)e.carry.targetCarry,
+        e.extendedInfo.pageTableWay, (int)e.carry.targetCarry,
         (int)e.attr.branchType, (int)e.attr.rasAction);
 }
 
@@ -1101,7 +965,7 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
     bool condNotTaken = inst->isCondCtrl() && !inst->branching();
     bool hitBranchTaken = stream.exeTaken && stream.getControlPC() == pc;
 
-    unsigned targetDiffBits = getTargetDiffBits(pc, npc);
+    // unsigned targetDiffBits = getTargetDiffBits(pc, npc);
 
     stats.totalBranchHits += branchHit;
     stats.totalBranchMisses += !branchHit;
@@ -1115,7 +979,7 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
         }
         if (inst->isCondCtrl()) {
             stats.condHits++;
-            stats.condTargetDiffBits.sample(targetDiffBits);
+            // stats.condTargetDiffBits.sample(targetDiffBits);
             if (hitBranchTaken) {
                 // stats.condHitTakens++;
             } else {
@@ -1132,13 +996,13 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
         }
         if (inst->isUncondCtrl()) {
             stats.uncondHits++;
-            stats.uncondTargetDiffBits.sample(targetDiffBits);
+            // stats.uncondTargetDiffBits.sample(targetDiffBits);
         }
         // ignore non-speculative branches (e.g. syscall)
         if (!inst->isNonSpeculative()) {
             if (inst->isIndirectCtrl()) {
                 stats.indirectHits++;
-                stats.indirectTargetDiffBits.sample(targetDiffBits);
+                // stats.indirectTargetDiffBits.sample(targetDiffBits);
                 Addr pred_target = entry.target;
                 if (pred_target == npc) {
                     // stats.indirectPredCorrect++;
@@ -1148,11 +1012,11 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
             }
             if (inst->isCall()) {
                 stats.callHits++;
-                stats.callTargetDiffBits.sample(targetDiffBits);
+                // stats.callTargetDiffBits.sample(targetDiffBits);
             }
             if (inst->isReturn()) {
                 stats.returnHits++;
-                stats.returnTargetDiffBits.sample(targetDiffBits);
+                // stats.returnTargetDiffBits.sample(targetDiffBits);
             }
         }
     } else {
@@ -1231,39 +1095,28 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(callHits, statistics::units::Count::get(), "Number of call branch hits"),
     ADD_STAT(callMisses, statistics::units::Count::get(), "Number of call branch misses"),
     ADD_STAT(returnHits, statistics::units::Count::get(), "Number of return branch hits"),
-    ADD_STAT(returnMisses, statistics::units::Count::get(), "Number of return branch misses"),
-    ADD_STAT(condTargetDiffBits, statistics::units::Count::get(),
-        "Target difference bits for conditional branch updates"),
-    ADD_STAT(uncondTargetDiffBits, statistics::units::Count::get(),
-        "Target difference bits for unconditional branonds"),
-    ADD_STAT(indirectTargetDiffBits, statistics::units::Count::get(),
-        "Target difference bits for indirect branch updates"),
-    ADD_STAT(callTargetDiffBits, statistics::units::Count::get(),
-        "Target difference bits for call branch updates"),
-    ADD_STAT(returnTargetDiffBits, statistics::units::Count::get(),
-        "Target difference bits for return branch updates"),
-    ADD_STAT(condAllocPartitionIdx, statistics::units::Count::get(),
-        "Partition index allocated for conditional branch updates"),
-    ADD_STAT(uncondAllocPartitionIdx, statistics::units::Count::get(),
-        "Partition index allocated for unconditional branch updates"),
-    ADD_STAT(indirectAllocPartitionIdx, statistics::units::Count::get(),
-        "Partition index allocated for indirect branch updates"),
-    ADD_STAT(callAllocPartitionIdx, statistics::units::Count::get(),
-        "Partition index allocated for call branch updates"),
-    ADD_STAT(returnAllocPartitionIdx, statistics::units::Count::get(),
-        "Partition index allocated for return branch updates")
+    ADD_STAT(returnMisses, statistics::units::Count::get(), "Number of return branch misses")
+    // ADD_STAT(condTargetDiffBits, statistics::units::Count::get(),
+    //     "Target difference bits for conditional branch updates"),
+    // ADD_STAT(uncondTargetDiffBits, statistics::units::Count::get(),
+    //     "Target difference bits for unconditional branonds"),
+    // ADD_STAT(indirectTargetDiffBits, statistics::units::Count::get(),
+    //     "Target difference bits for indirect branch updates"),
+    // ADD_STAT(callTargetDiffBits, statistics::units::Count::get(),
+    //     "Target difference bits for call branch updates"),
+    // ADD_STAT(returnTargetDiffBits, statistics::units::Count::get(),
+    //     "Target difference bits for return branch updates"),
+    // ADD_STAT(condAllocPartitionIdx, statistics::units::Count::get(),
+    //     "Partition index allocated for conditional branch updates"),
+    // ADD_STAT(uncondAllocPartitionIdx, statistics::units::Count::get(),
+    //     "Partition index allocated for unconditional branch updates"),
+    // ADD_STAT(indirectAllocPartitionIdx, statistics::units::Count::get(),
+    //     "Partition index allocated for indirect branch updates"),
+    // ADD_STAT(callAllocPartitionIdx, statistics::units::Count::get(),
+    //     "Partition index allocated for call branch updates"),
+    // ADD_STAT(returnAllocPartitionIdx, statistics::units::Count::get(),
+    //     "Partition index allocated for return branch updates")
 {
-    condTargetDiffBits.init(0, 64, 1);
-    uncondTargetDiffBits.init(0, 64, 1);
-    indirectTargetDiffBits.init(0, 64, 1);
-    callTargetDiffBits.init(0, 64, 1);
-    returnTargetDiffBits.init(0, 64, 1);
-
-    condAllocPartitionIdx.init(0, 8, 1);
-    uncondAllocPartitionIdx.init(0, 8, 1);
-    indirectAllocPartitionIdx.init(0, 8, 1);
-    callAllocPartitionIdx.init(0, 8, 1);
-    returnAllocPartitionIdx.init(0, 8, 1);
 }
 
 

@@ -1188,6 +1188,8 @@ class BTBPDede(TimedBaseBTBPredictor):
     cxx_class = 'gem5::branch_prediction::btb_pred::BTBPDede'
     cxx_header = "cpu/pred/btb/btb_pdede.hh"
 
+    enabled = False # Disable PDede by default
+
     numEntries = Param.Unsigned(8192, "Number of entries in the MonitorBTB")
     numPageEntries = Param.Unsigned(512, "Number of entries in the Page Table")
     numRegionEntries = Param.Unsigned(4, "Number of entries in the Region Table")
