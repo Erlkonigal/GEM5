@@ -419,11 +419,18 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
 }
 
 Addr BTBPDede::getPageTableIdx(Addr target) {
+    // Solution 1
     // select high floorLog2(numPageSets) bits from targetOffset
     // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
     // then we select bits [11:11-5+1] = bits [11:7] from targetOffset
     unsigned setWidth = floorLog2(numPageSets);
     Addr idx = (target >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
+
+    // Solution 2
+    // select low floorLog2(numPageSets) bits from targetOffset
+    // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
+    // then we select bits [5:1] from targetOffset
+    // Addr idx = (target >> instShiftAmt) & (numPageSets - 1);
     return idx;
 }
 
@@ -847,7 +854,7 @@ void BTBPDede::update(const FetchStream& stream) {
 
         unsigned evictWay = -1;
 
-        // first try to find invalid entry
+        // firstly try to find invalid entry
         for (unsigned i = 0; i < numWays; ++i) {
             auto &entry = toUpdate[i];
             if (!entry.valid) {

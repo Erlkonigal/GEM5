@@ -95,8 +95,8 @@ def setKmhV3Params(args, system):
             cpu.branchPred.ftq_size = 256
             cpu.branchPred.fsq_size = 256
 
-            cpu.branchPred.mbtb.resolvedUpdate = True
             cpu.branchPred.pdede.resolvedUpdate = True
+            cpu.branchPred.mbtb.resolvedUpdate = True
             cpu.branchPred.tage.resolvedUpdate = True
             cpu.branchPred.ittage.resolvedUpdate = True
 
@@ -136,7 +136,7 @@ def setKmhV3Params(args, system):
                     l2_wrapper.slices[j].inner_cache.do_fast_writeline = False
             system.tol2bus_list[i].forward_latency = 3  # 3->0
             system.tol2bus_list[i].response_latency = 3  # 3->0
-            system.tol2bus_list[i].hint_wakeup_ahead_cycles = 2  # 2->0
+            system.tol2bus_list[i].hint_wakeup_ahead_cycles = 1  # 1->0
 
             # Enable dual-port for DCache → L2 communication
             # ReqLayer[0]: ICache+DCache+ITB+DTB → L2, allow 2 requests per cycle
@@ -150,6 +150,7 @@ def setKmhV3Params(args, system):
     if args.l3cache:
         system.l3.mshrs = 64
         system.l3.do_fast_writeline = False
+        system.l3.num_slices = 4
 
 if __name__ == '__m5_main__':
     FutureClass = None
