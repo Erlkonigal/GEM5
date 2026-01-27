@@ -91,6 +91,7 @@ private:
         BranchAttribute attr;
         TargetCarry carry;
 
+        Addr pageTableSet;
         union ExtInfo
         {
             Addr pageTableWay; // used as long target with page pointer

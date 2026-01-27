@@ -125,7 +125,7 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr targetLower = entry.targetOffset << instShiftAmt;
 
     const auto &pageEntry =
-        pageTable[getPageTableIdx(targetLower)][entry.extendedInfo.pageTableWay];
+        pageTable[entry.pageTableSet][entry.extendedInfo.pageTableWay];
 
     Addr fullTarget = 0;
     TargetCarry carry = entry.carry;
@@ -423,14 +423,23 @@ Addr BTBPDede::getPageTableIdx(Addr target) {
     // select high floorLog2(numPageSets) bits from targetOffset
     // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
     // then we select bits [11:11-5+1] = bits [11:7] from targetOffset
-    unsigned setWidth = floorLog2(numPageSets);
-    Addr idx = (target >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
+    // unsigned setWidth = floorLog2(numPageSets);
+    // Addr idx = (target >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
 
     // Solution 2
     // select low floorLog2(numPageSets) bits from targetOffset
     // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
     // then we select bits [5:1] from targetOffset
     // Addr idx = (target >> instShiftAmt) & (numPageSets - 1);
+
+    unsigned setWidth = floorLog2(numPageSets);
+    Addr idxFull = (target >> (instShiftAmt + maxOffsetBits));
+
+    // use idxFull[setWidth * 2 - 1:setWidth] ^ idxFull[setWidth - 1:0] to reduce conflicts
+    Addr idxHigher = (idxFull >> setWidth) & mask(setWidth);
+    Addr idxLower = idxFull & mask(setWidth);
+    Addr idx = idxHigher ^ idxLower;
+
     return idx;
 }
 
@@ -525,7 +534,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
 
             // update page table LRU state if using page pointer
             if (entry.isUsePagePointer() && entry.isCrossPage) {
-                Addr pageTableIdx = getPageTableIdx(entry.targetOffset << instShiftAmt);
+                Addr pageTableIdx = entry.pageTableSet;
                 unsigned currentPagePLRUState = pagePLRUTable[pageTableIdx];
                 unsigned touchedPagePLRUState = getTouchedPLRUState(
                     currentPagePLRUState,
@@ -780,6 +789,7 @@ void BTBPDede::update(const FetchStream& stream) {
     newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
     newEntry.attr = execAttr;
     newEntry.carry = (isCrossPage) ? longCarry : shortCarry;
+    newEntry.pageTableSet = pageTableIdx;
 
     // compute extended info
     if (isCrossPage) {
@@ -942,7 +952,7 @@ void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
         "position:%d, tag:%#lx, targetOffset:%#lx, pagePointerSet:%#lx, "
         "extInfo:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
         e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
-        e.position, e.tag, e.targetOffset, getPageTableIdx(e.targetOffset << instShiftAmt),
+        e.position, e.tag, e.targetOffset, e.pageTableSet,
         e.extendedInfo.pageTableWay, (int)e.carry.targetCarry,
         (int)e.attr.branchType, (int)e.attr.rasAction);
 }
