@@ -1199,7 +1199,7 @@ class BTBPDede(TimedBaseBTBPredictor):
     numWays = Param.Unsigned(4, "Number of ways per set")
     numPageWays = Param.Unsigned(16, "Number of ways per set in Page Table")
     numRegionWays = Param.Unsigned(1, "Number of ways per set in Region Table")
-    victimCacheEntries = Param.Unsigned(16, "Number of entries in the victim cache")
+    victimCacheEntries = Param.Unsigned(0, "Number of entries in the victim cache")
     numDelay = 2
     blockSize = 32  # max 64 byte block, 32 byte aligned
 

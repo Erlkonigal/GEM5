@@ -10,6 +10,7 @@ from m5.util.fdthelper import *
 addToPath('../')
 
 from ruby import Ruby
+from common.LSQBankConflict import set_lsq_bank_conflict_cache_params
 
 from common.FSConfig import *
 from common.SysPaths import *
@@ -17,7 +18,6 @@ from common.Benchmarks import *
 from common import Simulation
 from common.Caches import *
 from common.xiangshan import *
-
 
 def setKmhV3Params(args, system):
     for cpu in system.cpu:
@@ -95,8 +95,8 @@ def setKmhV3Params(args, system):
             cpu.branchPred.ftq_size = 256
             cpu.branchPred.fsq_size = 256
 
-            cpu.branchPred.pdede.resolvedUpdate = True
             cpu.branchPred.mbtb.resolvedUpdate = True
+            cpu.branchPred.pdede.resolvedUpdate = True
             cpu.branchPred.tage.resolvedUpdate = True
             cpu.branchPred.ittage.resolvedUpdate = True
 
@@ -108,7 +108,7 @@ def setKmhV3Params(args, system):
             cpu.branchPred.tage.enabled = True
             cpu.branchPred.ittage.enabled = True
             cpu.branchPred.mgsc.enabled = False
-            cpu.branchPred.ras.enabled = False
+            cpu.branchPred.ras.enabled = True
 
         # l1 cache per core
         if args.caches:
@@ -117,6 +117,9 @@ def setKmhV3Params(args, system):
             cpu.dcache.tag_load_read_ports = 3
             cpu.dcache.mshrs = 16
             cpu.dcache.do_fast_writeline = False
+            cpu.dcache.simulate_dcache_refill = True
+            cpu.dcache.prefetch_can_offload = False
+            set_lsq_bank_conflict_cache_params(cpu, system)
 
     # l2 caches
     if args.l2cache:
@@ -125,6 +128,10 @@ def setKmhV3Params(args, system):
                 system.l2_caches[i].slice_num = 4
                 system.l2_caches[i].wpu = NULL
                 system.l2_caches[i].do_fast_writeline = False
+                system.l2_caches[i].prefetch_can_offload = False
+                # Configure XSDRRIP replacement policy (DRRIP mode)
+                # L2: 2MB, 8-way, 64B line → 4096 sets
+                system.l2_caches[i].replacement_policy = XSDRRIPRP(mode=2, num_sets=4096)
             else:
                 l2_wrapper = system.l2_wrappers[i]
                 l2_wrapper.data_sram_banks = 1
@@ -134,6 +141,10 @@ def setKmhV3Params(args, system):
                 for j in range(args.l2_slices):
                     l2_wrapper.slices[j].inner_cache.wpu = NULL
                     l2_wrapper.slices[j].inner_cache.do_fast_writeline = False
+                    l2_wrapper.slices[j].inner_cache.prefetch_can_offload = False
+                    # Configure XSDRRIP replacement policy (DRRIP mode)
+                    # Each slice: 2MB/4 = 512KB, 8-way, 64B line → 1024 sets
+                    l2_wrapper.slices[j].inner_cache.replacement_policy = XSDRRIPRP(mode=2, num_sets=1024)
             system.tol2bus_list[i].forward_latency = 3  # 3->0
             system.tol2bus_list[i].response_latency = 3  # 3->0
             system.tol2bus_list[i].hint_wakeup_ahead_cycles = 1  # 1->0
@@ -150,6 +161,7 @@ def setKmhV3Params(args, system):
     if args.l3cache:
         system.l3.mshrs = 64
         system.l3.do_fast_writeline = False
+        system.l3.prefetch_can_offload = False
         system.l3.num_slices = 4
 
 if __name__ == '__m5_main__':
