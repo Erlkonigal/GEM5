@@ -1,7 +1,8 @@
 #ifndef __CPU_PRED_BTB_PDEDE_HH__
 #define __CPU_PRED_BTB_PDEDE_HH__
 
-#include "cpu/pred/btb/stream_struct.hh"
+#include "base/types.hh"
+#include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 
 #ifdef UNIT_TEST
@@ -85,6 +86,7 @@ private:
     public:
         bool valid;
         bool isCrossPage;
+        bool alwaysTaken;
         unsigned position; // position in the fetch block
         Addr tag;
         Addr targetOffset; // target low bits
@@ -95,13 +97,15 @@ private:
         union ExtInfo
         {
             Addr pageTableWay; // used as long target with page pointer
-            unsigned ctr;        // used as conditional short target prediction counter
+            int8_t ctr;        // used as conditional short target prediction counter, range [-2, 1]
         } extendedInfo;
 
 
-        MonitorEntry() : offsetBits(maxOffsetBits), usePagePointer(true), valid(false) {}
+        MonitorEntry() : offsetBits(maxOffsetBits), usePagePointer(true), valid(false),
+            isCrossPage(false), alwaysTaken(true) {}
         MonitorEntry(int offsetBits, bool usePagePointer)
-            : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false) {}
+            : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false),
+              isCrossPage(false), alwaysTaken(true) {}
 
         int getOffsetBits() const { return offsetBits; }
         bool isUsePagePointer() const { return usePagePointer; }
@@ -248,9 +252,9 @@ public:
 
     std::shared_ptr<void> getPredictionMeta() override;
 
-    void update(const FetchStream& stream) override;
+    void update(const FetchTarget& stream) override;
 
-    void commitBranch(const FetchStream &stream, const DynInstPtr &inst) override;
+    void commitBranch(const FetchTarget &stream, const DynInstPtr &inst) override;
 };
 
 }

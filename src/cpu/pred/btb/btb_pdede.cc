@@ -124,21 +124,22 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
 {
     Addr targetLower = entry.targetOffset << instShiftAmt;
 
-    const auto &pageEntry =
-        pageTable[entry.pageTableSet][entry.extendedInfo.pageTableWay];
-
     Addr fullTarget = 0;
     TargetCarry carry = entry.carry;
-
-    Addr pcUpper = pc & ~mask(pageBits + maxOffsetBits + instShiftAmt);
-    Addr pcUpperPlusOne = pcUpper + (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
-    Addr pcUpperMinusOne = pcUpper - (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
 
     Addr pcMiddle = pc & ~mask(entry.getOffsetBits() + instShiftAmt);
     Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
     Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.getOffsetBits() + instShiftAmt));
 
+    // Only access page table for cross-page entries that use page pointer
     if (entry.isUsePagePointer() && entry.isCrossPage) {
+        const auto &pageEntry =
+            pageTable[entry.pageTableSet][entry.extendedInfo.pageTableWay];
+
+        Addr pcUpper = pc & ~mask(pageBits + maxOffsetBits + instShiftAmt);
+        Addr pcUpperPlusOne = pcUpper + (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
+        Addr pcUpperMinusOne = pcUpper - (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
+
         Addr pageSection = pageEntry.tag << (maxOffsetBits + instShiftAmt);
 
         if (carry.isFit()) {
@@ -154,28 +155,8 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
             fullTarget = pageSection | targetLower; // invalid target
         }
     }
-    // else if (entry.isUsePagePointer()) {
-    //     // we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
-    //     pcMiddle = pc & ~mask(floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt);
-    //     pcMiddlePlusOne = pcMiddle + (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
-    //     pcMiddleMinusOne = pcMiddle - (1ULL << (floorLog2(numPageWays) + entry.getOffsetBits() + instShiftAmt));
-
-    //     Addr pageSection = entry.pagePointerWay << (maxOffsetBits + instShiftAmt);
-
-    //     if (carry.isFit()) {
-    //         fullTarget = pcMiddle | pageSection | targetLower;
-    //     }
-    //     else if (carry.isPlusOne()) {
-    //         fullTarget = pcMiddlePlusOne | pageSection | targetLower;
-    //     }
-    //     else if (carry.isMinusOne()){
-    //         fullTarget = pcMiddleMinusOne | pageSection | targetLower;
-    //     }
-    //     else {
-    //         fullTarget = pageSection | targetLower; // invalid target
-    //     }
-    // }
     else {
+        // Non-crossPage entries: use carry bits with pcMiddle
         if (carry.isFit()) {
             fullTarget = pcMiddle | targetLower;
         }
@@ -501,6 +482,11 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             btbEntry.isCall = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Push);
             btbEntry.isReturn = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Pop);
             btbEntry.size = 1 << instShiftAmt; // assume size is 2^instShiftAmt
+            // Set counter for conditional branches (only valid for non-crossPage entries)
+            if (btbEntry.isCond && !entry.isCrossPage) {
+                btbEntry.alwaysTaken = entry.alwaysTaken;
+                btbEntry.ctr = entry.extendedInfo.ctr;
+            }
             btbEntries.push_back(btbEntry);
             DPRINTF(BTBPDede, "BTBPDede: found valid BTB entry pc %#lx target %#lx\n",
                 btbEntry.pc, btbEntry.target);
@@ -627,14 +613,7 @@ void BTBPDede::fillStagePredictions(
     for (auto &e : btbEntries) {
         assert(e.valid);
         if (e.isCond) {
-            // TODO: a performance bug here, mbtb should not update condTakens!
-            // if (isL0()) {  // only L0 BTB has saturating counter
-            // use saturating counter of L0 BTB
-
-            // FillStageLoop(s) stagePreds[s].condTakens.push_back({e.pc, e.alwaysTaken || (e.ctr >= 0)});
-
-            // } else {  // L1 BTB condTakens depends on the TAGE predictor
-            // }
+            FillStageLoop(s) stagePreds[s].condTakens.push_back({e.pc, e.alwaysTaken || (e.ctr >= 0)});
         } else if (e.isIndirect) {
             // Set predicted target for indirect branches
             DPRINTF(BTBPDede, "setting indirect target for pc %#lx to %#lx\n", e.pc, e.target);
@@ -666,7 +645,7 @@ void BTBPDede::putPCHistory(
     fillStagePredictions(processed_entries, stagePreds);
 }
 
-void BTBPDede::update(const FetchStream& stream) {
+void BTBPDede::update(const FetchTarget& stream) {
     DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
 
     if (stream.squashType != SQUASH_CTRL) {
@@ -784,6 +763,7 @@ void BTBPDede::update(const FetchStream& stream) {
     MonitorEntry newEntry;
     newEntry.valid = true;
     newEntry.isCrossPage = isCrossPage;
+    newEntry.alwaysTaken = true;
     newEntry.position = alignedPosition;
     newEntry.tag = monitorTag;
     newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
@@ -829,7 +809,25 @@ void BTBPDede::update(const FetchStream& stream) {
         updatePagePLRUState(pageTableWay);
     }
     else {
-        // TODO: add saturated counter update logic
+        // Initialize counter for non-crossPage conditional branches
+        newEntry.extendedInfo.ctr = 0;
+    }
+
+    // Update counter for conditional branches (only for non-crossPage entries)
+    if (!isCrossPage && execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
+        bool this_cond_taken = stream.exeTaken && stream.getControlPC() == exec.pc;
+        if (!this_cond_taken) {
+            newEntry.alwaysTaken = false;
+        }
+        if (!newEntry.alwaysTaken) {
+            // Update 2-bit saturating counter, range [-2, 1]
+            if (this_cond_taken && newEntry.extendedInfo.ctr < 1) {
+                newEntry.extendedInfo.ctr++;
+            }
+            if (!this_cond_taken && newEntry.extendedInfo.ctr > -2) {
+                newEntry.extendedInfo.ctr--;
+            }
+        }
     }
 
     if (foundWay != -1) {
@@ -962,7 +960,7 @@ void BTBPDede::printPageEntry(const PageEntry& e) {
         e.tag, e.ctr);
 }
 
-void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
+void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
     auto meta = std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
     const auto &rawEntries = meta->rawMonitorSets;
     const auto &btbEntries = meta->btbEntries;
@@ -988,7 +986,6 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
     stats.totalBranchMisses += !branchHit;
 
     if (branchHit) {
-        stats.totalBranchHits++;
         if (hitBranchTaken) {
             // stats.totalBranchHitTakens++;
         } else {
@@ -1037,7 +1034,6 @@ void BTBPDede::commitBranch(const FetchStream &stream, const DynInstPtr &inst) {
             }
         }
     } else {
-        stats.totalBranchMisses++;
         if (hitBranchTaken) {
             // stats.totalBranchMissTakens++;
         } else {
