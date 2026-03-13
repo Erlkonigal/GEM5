@@ -274,7 +274,10 @@ DecoupledBPUWithBTB::generateFinalPredAndCreateBubbles(ThreadID tid)
             }else if (pred_taken_entry.isCond) {
                 finalPred.s3Source = tage->getComponentIdx();
             } else {
-                finalPred.s3Source = mbtb->getComponentIdx();
+                if (pdede->isEnabled())
+                    finalPred.s3Source = pdede->getComponentIdx();
+                else
+                    finalPred.s3Source = mbtb->getComponentIdx();
             }
         }else {
             if (na_s3_taken_but_have_cond) {

@@ -462,6 +462,7 @@ DecoupledBPUWithBTB::DBPBTBStats::DBPBTBStats(
     ADD_STAT(s1PredWrongUbtb, statistics::units::Count::get(),"S1pred wrong using ubtb "),
     ADD_STAT(s1PredWrongAbtb, statistics::units::Count::get(), "S1pred wrong using abtb "),
     ADD_STAT(s3PredWrongMbtb, statistics::units::Count::get(), "S3pred wrong blame mbtb "),
+    ADD_STAT(s3PredWrongPdede, statistics::units::Count::get(), "S3pred wrong blame pdede "),
     ADD_STAT(s3PredWrongTage, statistics::units::Count::get(), "S3pred wrong blame tage "),
     ADD_STAT(s3PredWrongIttage, statistics::units::Count::get(), "S3pred wrong blame ittage "),
     ADD_STAT(s3PredWrongRas, statistics::units::Count::get(), "S3pred wrong blame ras ")
@@ -840,6 +841,7 @@ DecoupledBPUWithBTB::commitPredWrongSource(const FetchTarget &entry)
     int ubtbid = ubtb->getComponentIdx();
     int abtbid = abtb->getComponentIdx();
     int mbtbid = mbtb->getComponentIdx();
+    int pdedeid = pdede->getComponentIdx();
     int tageid = tage->getComponentIdx();
     int ittageid = ittage->getComponentIdx();
     int rasid = ras->getComponentIdx();
@@ -851,7 +853,7 @@ DecoupledBPUWithBTB::commitPredWrongSource(const FetchTarget &entry)
 
     bool onlyDirectionWrong = entry.exeTaken != entry.predTaken;
 
-    assert(s1PredSource < mbtbid);
+    assert(s1PredSource < (pdede->isEnabled()? pdedeid : mbtbid));
     if (s1PredSource == ubtbid) {
         dbpBtbStats.s1PredWrongUbtb++;
     } else if (s1PredSource == abtbid) {
@@ -866,7 +868,10 @@ DecoupledBPUWithBTB::commitPredWrongSource(const FetchTarget &entry)
         } else if (exeBranchInfo.isReturn) {
             dbpBtbStats.s3PredWrongRas++;
         } else {
-            dbpBtbStats.s3PredWrongMbtb++;
+            if (pdede->isEnabled())
+                dbpBtbStats.s3PredWrongPdede++;
+            else
+                dbpBtbStats.s3PredWrongMbtb++;
         }
     } else if (s3PredSource == ittageid) {
         if (exeBranchInfo.isIndirect) {
@@ -874,32 +879,62 @@ DecoupledBPUWithBTB::commitPredWrongSource(const FetchTarget &entry)
         } else if (exeBranchInfo.isCond) {
             dbpBtbStats.s3PredWrongTage++;
         } else {
-            dbpBtbStats.s3PredWrongMbtb++;
+            if (pdede->isEnabled())
+                dbpBtbStats.s3PredWrongPdede++;
+            else
+                dbpBtbStats.s3PredWrongMbtb++;
         }
     } else if (s3PredSource == tageid) {
         if (exeBranchInfo.isCond) {
             if (onlyDirectionWrong) {
                 dbpBtbStats.s3PredWrongTage++;
             } else {
-                dbpBtbStats.s3PredWrongMbtb++;
+                if (pdede->isEnabled())
+                    dbpBtbStats.s3PredWrongPdede++;
+                else
+                    dbpBtbStats.s3PredWrongMbtb++;
             }
         } else {
-            dbpBtbStats.s3PredWrongMbtb++;
+            if (pdede->isEnabled())
+                dbpBtbStats.s3PredWrongPdede++;
+            else
+                dbpBtbStats.s3PredWrongMbtb++;
         }
-    }else if (s3PredSource == mbtbid) {
+    } else if (s3PredSource == pdedeid) {
         if (exeBranchInfo.isCond) {
             if (onlyDirectionWrong) {
                 dbpBtbStats.s3PredWrongTage++;
             } else {
-                dbpBtbStats.s3PredWrongMbtb++;
+                dbpBtbStats.s3PredWrongPdede++;
             }
         } else if (exeBranchInfo.isIndirect) {
             dbpBtbStats.s3PredWrongIttage++;
         } else {
-            dbpBtbStats.s3PredWrongMbtb++;
+            dbpBtbStats.s3PredWrongPdede++;
+        }
+    } else if (s3PredSource == mbtbid) {
+        if (exeBranchInfo.isCond) {
+            if (onlyDirectionWrong) {
+                dbpBtbStats.s3PredWrongTage++;
+            } else {
+                if (pdede->isEnabled())
+                    dbpBtbStats.s3PredWrongPdede++;
+                else
+                    dbpBtbStats.s3PredWrongMbtb++;
+            }
+        } else if (exeBranchInfo.isIndirect) {
+            dbpBtbStats.s3PredWrongIttage++;
+        } else {
+            if (pdede->isEnabled())
+                dbpBtbStats.s3PredWrongPdede++;
+            else
+                dbpBtbStats.s3PredWrongMbtb++;
         }
     }else if (s3PredSource == -1) {
-        dbpBtbStats.s3PredWrongMbtb++;
+        if (pdede->isEnabled())
+            dbpBtbStats.s3PredWrongPdede++;
+        else
+            dbpBtbStats.s3PredWrongMbtb++;
     }
 }
 /**

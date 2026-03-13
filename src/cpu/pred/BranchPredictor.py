@@ -984,7 +984,7 @@ class MBTB(TimedBaseBTBPredictor):
     numDelay = 2
     blockSize = 32  # max 64 byte block, 32 byte aligned
     # MBTB is always half-aligned - no parameter needed
-    victimCacheSize = Param.Unsigned(16, "Number of entries in the victim cache")
+    victimCacheSize = Param.Unsigned(0, "Number of entries in the victim cache")
 
 class AheadBTB(TimedBaseBTBPredictor):
     type = 'AheadBTB'
@@ -1191,7 +1191,7 @@ class BTBPDede(TimedBaseBTBPredictor):
     numEntries = Param.Unsigned(8192, "Number of entries in the MonitorBTB")
     numPageEntries = Param.Unsigned(256, "Number of entries in the Page Table")
     numRegionEntries = Param.Unsigned(4, "Number of entries in the Region Table")
-    tagBits = Param.Unsigned(12, "Number of bits in the tag")
+    tagBits = Param.Unsigned(20, "Number of bits in the tag")
     tagFoldedBits = Param.Unsigned(4, "Number of folded tag bits for indexing")
     pageBits = Param.Unsigned(16, "Number of bits for page offset")
     instShiftAmt = Param.Unsigned(1, "Amount to shift PC to get inst bits")

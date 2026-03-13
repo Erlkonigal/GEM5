@@ -87,7 +87,8 @@ private:
         bool valid;
         bool isCrossPage;
         bool alwaysTaken;
-        unsigned position; // position in the fetch block
+        bool isRVC; // true: 2-byte compressed instruction, false: 4-byte standard instruction
+        unsigned position; // position of the last 2 bytes in the fetch block
         Addr tag;
         Addr targetOffset; // target low bits
         BranchAttribute attr;
@@ -102,10 +103,10 @@ private:
 
 
         MonitorEntry() : offsetBits(maxOffsetBits), usePagePointer(true), valid(false),
-            isCrossPage(false), alwaysTaken(true) {}
+            isCrossPage(false), alwaysTaken(true), isRVC(true) {}
         MonitorEntry(int offsetBits, bool usePagePointer)
             : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false),
-              isCrossPage(false), alwaysTaken(true) {}
+              isCrossPage(false), alwaysTaken(true), isRVC(true) {}
 
         int getOffsetBits() const { return offsetBits; }
         bool isUsePagePointer() const { return usePagePointer; }

@@ -304,6 +304,7 @@ class DecoupledBPUWithBTB : public BPredUnit
         statistics::Scalar s1PredWrongUbtb;
         statistics::Scalar s1PredWrongAbtb;
         statistics::Scalar s3PredWrongMbtb;
+        statistics::Scalar s3PredWrongPdede;
         statistics::Scalar s3PredWrongTage;
         statistics::Scalar s3PredWrongIttage;
         statistics::Scalar s3PredWrongRas;

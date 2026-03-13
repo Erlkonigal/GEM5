@@ -452,7 +452,12 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             MonitorEntry &entry =
                 (way < numWays) ? bank[way] : victimCache[phyBankIdx][way - numWays];
 
-            Addr branchPC = alignedAddr + (entry.position << instShiftAmt);
+            Addr branchPC;
+            if (entry.isRVC) {
+                branchPC = alignedAddr + (entry.position << 1);
+            } else {
+                branchPC = alignedAddr + (entry.position << 1) - 2;
+            }
             Addr monitorIdx = getMonitorIdx(alignedAddr);
             Addr monitorTag = getMonitorTag(alignedAddr);
             Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
@@ -481,8 +486,16 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             btbEntry.isIndirect = (entry.attr.branchType == BranchAttribute::BranchTypeEnum::Indirect);
             btbEntry.isCall = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Push);
             btbEntry.isReturn = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Pop);
-            btbEntry.size = 1 << instShiftAmt; // assume size is 2^instShiftAmt
+            btbEntry.size = entry.isRVC ? 2 : 4;
             // Set counter for conditional branches (only valid for non-crossPage entries)
+            if (btbEntry.isCond && entry.isCrossPage) {
+                printf("BTBPDede: found conditional branch entry with cross-page target"
+                                ", which is not supported. pc %#lx\n",
+                    btbEntry.pc);
+                printf("BTBPDede: entry details - isCond %d, isIndirect %d, isCall %d, isReturn %d, isCrossPage %d\n",
+                    btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn, entry.isCrossPage);
+                assert(!(btbEntry.isCond && entry.isCrossPage));
+            }
             if (btbEntry.isCond && !entry.isCrossPage) {
                 btbEntry.alwaysTaken = entry.alwaysTaken;
                 btbEntry.ctr = entry.extendedInfo.ctr;
@@ -652,8 +665,11 @@ void BTBPDede::update(const FetchTarget& stream) {
         DPRINTF(BTBPDede, "BTBPDede: update skipped due to non-control squash\n");
         return;
     }
-    if (!stream.exeTaken) {
-        DPRINTF(BTBPDede, "BTBPDede: update skipped due to not taken branch\n");
+
+    // For conditional branches, we need to update even when not taken
+    // to maintain the counter and alwaysTaken flag
+    if (!stream.exeTaken && !stream.exeBranchInfo.isCond) {
+        DPRINTF(BTBPDede, "BTBPDede: update skipped due to not taken unconditional branch\n");
         return;
     }
 
@@ -668,7 +684,26 @@ void BTBPDede::update(const FetchTarget& stream) {
     unsigned monitorTag = getMonitorTag(exec.pc);
     unsigned pageTableIdx = getPageTableIdx(exec.target);
     unsigned pageTableTag = getPageTableTag(exec.target);
-    unsigned alignedPosition = (exec.pc & (blockSize - 1)) >> instShiftAmt;
+
+    // Detect instruction size and calculate position
+    bool isRVC = (exec.size == 2);
+    unsigned offset = exec.pc & (blockSize - 1);
+
+    // Cross-block detection: skip 4-byte instructions that cross block boundary
+    if (!isRVC && (offset + 4 > blockSize)) {
+        DPRINTF(BTBPDede, "BTBPDede: skipping cross-block 4-byte instruction at %#lx\n", exec.pc);
+        return;
+    }
+
+    // Calculate position: points to the last 2 bytes of the instruction
+    unsigned alignedPosition;
+    if (isRVC) {
+        // 2-byte instruction: position = offset / 2
+        alignedPosition = offset >> 1;
+    } else {
+        // 4-byte instruction: position = (offset + 2) / 2
+        alignedPosition = (offset + 2) >> 1;
+    }
 
     auto &toUpdate = monitorTable[alignedBankIdx][monitorIdx];
 
@@ -764,6 +799,7 @@ void BTBPDede::update(const FetchTarget& stream) {
     newEntry.valid = true;
     newEntry.isCrossPage = isCrossPage;
     newEntry.alwaysTaken = true;
+    newEntry.isRVC = isRVC;
     newEntry.position = alignedPosition;
     newEntry.tag = monitorTag;
     newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
@@ -815,6 +851,15 @@ void BTBPDede::update(const FetchTarget& stream) {
 
     // Update counter for conditional branches (only for non-crossPage entries)
     if (!isCrossPage && execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
+        // Preserve existing ctr value from the found entry
+        if (foundWay != -1) {
+            newEntry.extendedInfo.ctr = toUpdate[foundWay].extendedInfo.ctr;
+            newEntry.alwaysTaken = toUpdate[foundWay].alwaysTaken;
+        } else if (foundVictimWay != -1) {
+            newEntry.extendedInfo.ctr = victimCache[alignedBankIdx][foundVictimWay].extendedInfo.ctr;
+            newEntry.alwaysTaken = victimCache[alignedBankIdx][foundVictimWay].alwaysTaken;
+        }
+
         bool this_cond_taken = stream.exeTaken && stream.getControlPC() == exec.pc;
         if (!this_cond_taken) {
             newEntry.alwaysTaken = false;
@@ -858,6 +903,13 @@ void BTBPDede::update(const FetchTarget& stream) {
     }
     else {
         // need to allocate new entry
+        // For conditional branches that are not taken, don't allocate new entry
+        // only update existing entries to train the counter
+        if (!stream.exeTaken && execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
+            DPRINTF(BTBPDede, "BTBPDede: skip allocation for not taken conditional branch\n");
+            return;
+        }
+
         stats.updateMissTimes++;
 
         unsigned evictWay = -1;

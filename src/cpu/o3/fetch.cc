@@ -760,7 +760,11 @@ Fetch::lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc)
     const auto &stream = dbpbtb->ftqFetchingTarget(tid);
 
     const Addr curr_pc = next_pc.instAddr();
-    assert(stream.startPC <= curr_pc && curr_pc < stream.predEndPC);
+    if (!(stream.startPC <= curr_pc && curr_pc < stream.predEndPC)) {
+        printf("Fetch: current PC %#lx is without predicted stream [%#lx, %#lx)\n",
+               curr_pc, stream.startPC, stream.predEndPC);
+        assert(stream.startPC <= curr_pc && curr_pc < stream.predEndPC);
+    }
 
     bool run_out = false;
 
