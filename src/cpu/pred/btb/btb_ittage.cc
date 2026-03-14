@@ -260,6 +260,11 @@ BTBITTAGE::update(const FetchTarget &stream)
             ittageStats.updateMispred++;
         }
         bool &main_found = main_info.found;
+        if (main_found) {
+            ittageStats.updateMainFound++;
+        } else {
+            ittageStats.updateMainNotFound++;
+        }
         auto &main_counter = main_info.entry.counter;
         bool main_taken = main_info.taken();
         bool main_weak  = main_counter == 0;
@@ -279,7 +284,13 @@ BTBITTAGE::update(const FetchTarget &stream)
             bool alt_taken = (alt_info.found && alt_info.taken()) || !pred.altInfo.found;
             bool alt_diff = alt_taken != main_taken;
             if (alt_diff) {
+                ittageStats.updateAltDiff++;
                 way.useful = exe_target == main_target;
+                if (way.useful) {
+                    ittageStats.updateAltDiffSetUsefulTrue++;
+                } else {
+                    ittageStats.updateAltDiffSetUsefulFalse++;
+                }
             }
 
             // Update target hit statistics
@@ -303,6 +314,14 @@ BTBITTAGE::update(const FetchTarget &stream)
 
         bool use_alt_on_main_found_correct = used_alt && main_found && main_target == exe_target;
         bool needToAllocate = mispred && !use_alt_on_main_found_correct;
+        if (needToAllocate) {
+            ittageStats.updateNeedAllocate++;
+            if (main_found) {
+                ittageStats.updateNeedAllocateMainFound++;
+            } else {
+                ittageStats.updateNeedAllocateMainNotFound++;
+            }
+        }
         DPRINTF(ITTAGE, "mispred %d, use_alt_on_main_found_correct %d, needToAllocate %d\n",
             mispred, use_alt_on_main_found_correct, needToAllocate);
 
@@ -313,8 +332,26 @@ BTBITTAGE::update(const FetchTarget &stream)
             useful_mask.resize(alloc_table_num);
         }
         int num_tables_can_allocate = (~useful_mask).count();
-        bool canAllocate = num_tables_can_allocate > 0;
+#ifndef UNIT_TEST
         if (needToAllocate) {
+            ittageStats.updateAllocatableTables.sample(num_tables_can_allocate, 1);
+        }
+#endif
+        bool canAllocate = num_tables_can_allocate > 0;
+        if (needToAllocate && !canAllocate) {
+            ittageStats.updateUsefulMaskAllOnes++;
+        }
+        if (needToAllocate) {
+            if (canAllocate) {
+                ittageStats.updateNeedAllocateCanAllocate++;
+            } else {
+                ittageStats.updateNeedAllocateCannotAllocate++;
+                if (main_found) {
+                    ittageStats.updateNeedAllocateCannotAllocateMainFound++;
+                } else {
+                    ittageStats.updateNeedAllocateCannotAllocateMainNotFound++;
+                }
+            }
             if (canAllocate) {
                 usefulResetCnt -= 1;
                 if (usefulResetCnt <= 0) {
@@ -647,8 +684,32 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
     ADD_STAT(updateAllocFailure, statistics::units::Count::get(), "allocation failure when update"),
     ADD_STAT(updateResetU, statistics::units::Count::get(), "reset useful bits when update"),
     ADD_STAT(updateUseAltCorrect, statistics::units::Count::get(), "use alternative prediction and correct on update"),
+    ADD_STAT(updateMainFound, statistics::units::Count::get(), "update entries with main provider found"),
+    ADD_STAT(updateMainNotFound, statistics::units::Count::get(), "update entries with no main provider"),
+    ADD_STAT(updateNeedAllocate, statistics::units::Count::get(), "update entries that need allocation"),
+    ADD_STAT(updateNeedAllocateMainFound, statistics::units::Count::get(),
+        "need allocation with main provider found"),
+    ADD_STAT(updateNeedAllocateMainNotFound, statistics::units::Count::get(),
+        "need allocation with no main provider"),
+    ADD_STAT(updateNeedAllocateCanAllocate, statistics::units::Count::get(),
+        "need allocation and allocatable table exists"),
+    ADD_STAT(updateNeedAllocateCannotAllocate, statistics::units::Count::get(),
+        "need allocation but no allocatable table"),
+    ADD_STAT(updateNeedAllocateCannotAllocateMainFound, statistics::units::Count::get(),
+        "cannot allocate when main provider found"),
+    ADD_STAT(updateNeedAllocateCannotAllocateMainNotFound, statistics::units::Count::get(),
+        "cannot allocate when no main provider"),
+    ADD_STAT(updateUsefulMaskAllOnes, statistics::units::Count::get(),
+        "need allocation and all candidate tables have useful=1"),
+    ADD_STAT(updateAltDiff, statistics::units::Count::get(), "alt/main taken differ while updating main provider"),
+    ADD_STAT(updateAltDiffSetUsefulTrue, statistics::units::Count::get(),
+        "alt diff sets useful to true"),
+    ADD_STAT(updateAltDiffSetUsefulFalse, statistics::units::Count::get(),
+        "alt diff sets useful to false"),
     ADD_STAT(predTableHits, statistics::units::Count::get(), "hit of each tage table on prediction"),
     ADD_STAT(updateTableHits, statistics::units::Count::get(), "hit of each tage table on update"),
+    ADD_STAT(updateAllocatableTables, statistics::units::Count::get(),
+        "number of allocatable tables when allocation is needed"),
 
     ADD_STAT(commitHits, statistics::units::Count::get(), "number of indirect branch commits that hit in ITTAGE"),
     ADD_STAT(callHits, statistics::units::Count::get(), "number of call commits that hit in ITTAGE"),
@@ -665,6 +726,7 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
 {
     predTableHits.init(0, numPredictors-1, 1);
     updateTableHits.init(0, numPredictors-1, 1);
+    updateAllocatableTables.init(0, numPredictors, 1);
 }
 #endif
 

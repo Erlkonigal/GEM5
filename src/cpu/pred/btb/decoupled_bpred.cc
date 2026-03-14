@@ -661,9 +661,11 @@ DecoupledBPUWithBTB::prepareResolveUpdateEntries(unsigned &target_id, ThreadID t
         target.setUpdateInstEndPC(predictWidth);
         target.setUpdateBTBEntries();
 
-        // only mbtb can generate new entry
+        // only mbtb/pdede can generate new entry
         if (mbtb->isEnabled()) {
             mbtb->getAndSetNewBTBEntry(target);
+        } else if (pdede->isEnabled()) {
+            pdede->getAndSetNewBTBEntry(target);
         }
     }
 }
@@ -694,9 +696,11 @@ DecoupledBPUWithBTB::updatePredictorComponents(FetchTarget &target)
         target.setUpdateInstEndPC(predictWidth);
         target.setUpdateBTBEntries();
 
-        // only mbtb can generate new entry
+        // only mbtb/pdede can generate new entry
         if (mbtb->isEnabled()) {
             mbtb->getAndSetNewBTBEntry(target);
+        } else if (pdede->isEnabled()) {
+            pdede->getAndSetNewBTBEntry(target);
         }
 
         // Update predictor components

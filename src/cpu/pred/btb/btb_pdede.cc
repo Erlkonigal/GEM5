@@ -661,10 +661,8 @@ void BTBPDede::putPCHistory(
 void BTBPDede::update(const FetchTarget& stream) {
     DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
 
-    if (stream.squashType != SQUASH_CTRL) {
-        DPRINTF(BTBPDede, "BTBPDede: update skipped due to non-control squash\n");
-        return;
-    }
+    // Update on normal commit path as well, not only control-squash recovery.
+    // The caller already gates updates to meaningful targets.
 
     // For conditional branches, we need to update even when not taken
     // to maintain the counter and alwaysTaken flag
@@ -689,11 +687,8 @@ void BTBPDede::update(const FetchTarget& stream) {
     bool isRVC = (exec.size == 2);
     unsigned offset = exec.pc & (blockSize - 1);
 
-    // Cross-block detection: skip 4-byte instructions that cross block boundary
-    if (!isRVC && (offset + 4 > blockSize)) {
-        DPRINTF(BTBPDede, "BTBPDede: skipping cross-block 4-byte instruction at %#lx\n", exec.pc);
-        return;
-    }
+    // Note: Cross-block 4-byte instructions are supported
+    // Position encoding correctly handles the offset=30 case
 
     // Calculate position: points to the last 2 bytes of the instruction
     unsigned alignedPosition;
@@ -1012,6 +1007,43 @@ void BTBPDede::printPageEntry(const PageEntry& e) {
         e.tag, e.ctr);
 }
 
+void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)
+{
+    DPRINTF(BTBPDede, "getAndSetNewBTBEntry called for pc %#lx\n", stream.startPC);
+    auto meta = std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
+    auto &predBTBEntries = meta->btbEntries;
+
+    bool pred_branch_hit = false;
+    BTBEntry entry_to_write = BTBEntry();
+    for (auto &e: predBTBEntries) {
+        if (stream.exeBranchInfo == e) {
+            pred_branch_hit = true;
+            entry_to_write = e;
+            break;
+        }
+    }
+    bool is_old_entry = pred_branch_hit;
+
+    if (!pred_branch_hit && stream.exeTaken) {
+        DPRINTF(BTBPDede, "Creating new BTB entry for pc %#lx\n", stream.exeBranchInfo.pc);
+        BTBEntry new_entry = BTBEntry(stream.exeBranchInfo);
+        new_entry.valid = true;
+        if (new_entry.isCond) {
+            new_entry.alwaysTaken = true;
+            new_entry.ctr = 0;
+        }
+        entry_to_write = new_entry;
+        entry_to_write.resolved = stream.exeBranchInfo.resolved;
+        is_old_entry = false;
+    } else {
+        DPRINTF(BTBPDede, "Not creating new entry: pred_branch_hit=%d, stream.exeTaken=%d\n",
+                pred_branch_hit, stream.exeTaken);
+    }
+
+    stream.updateNewBTBEntry = entry_to_write;
+    stream.updateIsOldEntry = is_old_entry;
+}
+
 void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
     auto meta = std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
     const auto &rawEntries = meta->rawMonitorSets;
@@ -1068,12 +1100,73 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
         if (!inst->isNonSpeculative()) {
             if (inst->isIndirectCtrl()) {
                 stats.indirectHits++;
-                // stats.indirectTargetDiffBits.sample(targetDiffBits);
+                bool found_raw_entry = false;
+                bool entry_cross_page = false;
+                bool entry_use_page_pointer = false;
+                TargetCarry::TargetCarryEnum entry_carry = TargetCarry::TargetCarryEnum::None;
+                unsigned offset = pc & (blockSize - 1);
+                bool is_rvc = (entry.size == 2);
+                unsigned aligned_position = is_rvc ? (offset >> 1) : ((offset + 2) >> 1);
+                Addr monitor_tag = getMonitorTag(pc);
+                for (const auto &bank : rawEntries) {
+                    for (const auto &me : bank) {
+                        if (!me.valid) {
+                            continue;
+                        }
+                        if (me.position == aligned_position && me.tag == monitor_tag) {
+                            found_raw_entry = true;
+                            entry_cross_page = me.isCrossPage;
+                            entry_use_page_pointer = me.isUsePagePointer();
+                            entry_carry = me.carry.targetCarry;
+                            break;
+                        }
+                    }
+                    if (found_raw_entry) {
+                        break;
+                    }
+                }
+                if (found_raw_entry) {
+                    stats.indirectMetaFound++;
+                } else {
+                    stats.indirectMetaNotFound++;
+                }
+                if (found_raw_entry && entry_cross_page) {
+                    stats.indirectHitCrossPage++;
+                } else if (found_raw_entry) {
+                    stats.indirectHitNonCrossPage++;
+                }
                 Addr pred_target = entry.target;
                 if (pred_target == npc) {
-                    // stats.indirectPredCorrect++;
+                    stats.indirectPredCorrect++;
                 } else {
-                    // stats.indirectPredWrong++;
+                    stats.indirectPredWrong++;
+                    if (found_raw_entry && entry_cross_page) {
+                        stats.indirectPredWrongCrossPage++;
+                    } else if (found_raw_entry) {
+                        stats.indirectPredWrongNonCrossPage++;
+                    }
+                    if (found_raw_entry) {
+                        switch (entry_carry) {
+                          case TargetCarry::TargetCarryEnum::Fit:
+                            stats.indirectPredWrongCarryFit++;
+                            break;
+                          case TargetCarry::TargetCarryEnum::PlusOne:
+                            stats.indirectPredWrongCarryPlusOne++;
+                            break;
+                          case TargetCarry::TargetCarryEnum::MinusOne:
+                            stats.indirectPredWrongCarryMinusOne++;
+                            break;
+                          case TargetCarry::TargetCarryEnum::None:
+                          default:
+                            stats.indirectPredWrongCarryNone++;
+                            break;
+                        }
+                        if (entry_use_page_pointer) {
+                            stats.indirectPredWrongUsePagePointer++;
+                        } else {
+                            stats.indirectPredWrongNoPagePointer++;
+                        }
+                    }
                 }
             }
             if (inst->isCall()) {
@@ -1109,7 +1202,8 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
         if (!inst->isNonSpeculative()) {
             if (inst->isIndirectCtrl()) {
                 stats.indirectMisses++;
-                // stats.indirectPredWrong++;
+                stats.indirectMetaNotFound++;
+                stats.indirectPredWrong++;
             }
             if (inst->isCall()) {
                 stats.callMisses++;
@@ -1157,6 +1251,34 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(uncondMisses, statistics::units::Count::get(), "Number of unconditional branch misses"),
     ADD_STAT(indirectHits, statistics::units::Count::get(), "Number of indirect branch hits"),
     ADD_STAT(indirectMisses, statistics::units::Count::get(), "Number of indirect branch misses"),
+    ADD_STAT(indirectPredCorrect, statistics::units::Count::get(),
+        "indirect branches committed whose target was correctly predicted by btb"),
+    ADD_STAT(indirectPredWrong, statistics::units::Count::get(),
+        "indirect branches committed whose target was mispredicted by btb"),
+    ADD_STAT(indirectMetaFound, statistics::units::Count::get(),
+        "indirect branches whose monitor meta entry was found at commit"),
+    ADD_STAT(indirectMetaNotFound, statistics::units::Count::get(),
+        "indirect branches whose monitor meta entry was not found at commit"),
+    ADD_STAT(indirectHitCrossPage, statistics::units::Count::get(),
+        "indirect hit branches predicted by cross-page entries"),
+    ADD_STAT(indirectHitNonCrossPage, statistics::units::Count::get(),
+        "indirect hit branches predicted by non-cross-page entries"),
+    ADD_STAT(indirectPredWrongCrossPage, statistics::units::Count::get(),
+        "indirect target mispredictions from cross-page entries"),
+    ADD_STAT(indirectPredWrongNonCrossPage, statistics::units::Count::get(),
+        "indirect target mispredictions from non-cross-page entries"),
+    ADD_STAT(indirectPredWrongCarryFit, statistics::units::Count::get(),
+        "indirect target mispredictions with carry Fit"),
+    ADD_STAT(indirectPredWrongCarryPlusOne, statistics::units::Count::get(),
+        "indirect target mispredictions with carry PlusOne"),
+    ADD_STAT(indirectPredWrongCarryMinusOne, statistics::units::Count::get(),
+        "indirect target mispredictions with carry MinusOne"),
+    ADD_STAT(indirectPredWrongCarryNone, statistics::units::Count::get(),
+        "indirect target mispredictions with carry None"),
+    ADD_STAT(indirectPredWrongUsePagePointer, statistics::units::Count::get(),
+        "indirect target mispredictions on entries using page pointer"),
+    ADD_STAT(indirectPredWrongNoPagePointer, statistics::units::Count::get(),
+        "indirect target mispredictions on entries not using page pointer"),
     ADD_STAT(callHits, statistics::units::Count::get(), "Number of call branch hits"),
     ADD_STAT(callMisses, statistics::units::Count::get(), "Number of call branch misses"),
     ADD_STAT(returnHits, statistics::units::Count::get(), "Number of return branch hits"),

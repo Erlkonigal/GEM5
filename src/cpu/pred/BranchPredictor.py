@@ -1192,7 +1192,7 @@ class BTBPDede(TimedBaseBTBPredictor):
     numPageEntries = Param.Unsigned(256, "Number of entries in the Page Table")
     numRegionEntries = Param.Unsigned(4, "Number of entries in the Region Table")
     tagBits = Param.Unsigned(20, "Number of bits in the tag")
-    tagFoldedBits = Param.Unsigned(4, "Number of folded tag bits for indexing")
+    tagFoldedBits = Param.Unsigned(0, "Number of folded tag bits for indexing")
     pageBits = Param.Unsigned(16, "Number of bits for page offset")
     instShiftAmt = Param.Unsigned(1, "Amount to shift PC to get inst bits")
     numThreads = Param.Unsigned(1, "Number of threads")

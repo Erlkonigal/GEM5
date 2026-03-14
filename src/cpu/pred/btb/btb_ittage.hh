@@ -209,10 +209,24 @@ class BTBITTAGE : public TimedBaseBTBPredictor
         Scalar updateAllocFailure;
         Scalar updateResetU;
         Scalar updateUseAltCorrect;
+        Scalar updateMainFound;
+        Scalar updateMainNotFound;
+        Scalar updateNeedAllocate;
+        Scalar updateNeedAllocateMainFound;
+        Scalar updateNeedAllocateMainNotFound;
+        Scalar updateNeedAllocateCanAllocate;
+        Scalar updateNeedAllocateCannotAllocate;
+        Scalar updateNeedAllocateCannotAllocateMainFound;
+        Scalar updateNeedAllocateCannotAllocateMainNotFound;
+        Scalar updateUsefulMaskAllOnes;
+        Scalar updateAltDiff;
+        Scalar updateAltDiffSetUsefulTrue;
+        Scalar updateAltDiffSetUsefulFalse;
 
 #ifndef UNIT_TEST
         statistics::Distribution predTableHits;
         statistics::Distribution updateTableHits;
+        statistics::Distribution updateAllocatableTables;
 
         int numPredictors;
         IttageStats(statistics::Group* parent, int numPredictors);

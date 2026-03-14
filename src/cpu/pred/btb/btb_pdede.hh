@@ -221,6 +221,20 @@ private:
 
         Scalar indirectHits;
         Scalar indirectMisses;
+        Scalar indirectPredCorrect;
+        Scalar indirectPredWrong;
+        Scalar indirectMetaFound;
+        Scalar indirectMetaNotFound;
+        Scalar indirectHitCrossPage;
+        Scalar indirectHitNonCrossPage;
+        Scalar indirectPredWrongCrossPage;
+        Scalar indirectPredWrongNonCrossPage;
+        Scalar indirectPredWrongCarryFit;
+        Scalar indirectPredWrongCarryPlusOne;
+        Scalar indirectPredWrongCarryMinusOne;
+        Scalar indirectPredWrongCarryNone;
+        Scalar indirectPredWrongUsePagePointer;
+        Scalar indirectPredWrongNoPagePointer;
 
         Scalar callHits;
         Scalar callMisses;
@@ -256,6 +270,8 @@ public:
     void update(const FetchTarget& stream) override;
 
     void commitBranch(const FetchTarget &stream, const DynInstPtr &inst) override;
+
+    void getAndSetNewBTBEntry(FetchTarget &stream);
 };
 
 }
