@@ -59,8 +59,23 @@ BTBPDede::BTBPDede(const Params& p):
     for (unsigned set = 0; set < numPageSets; ++set) {
         pageTable[set].resize(numPageWays);
         for (unsigned way = 0; way < numPageWays; ++way) {
+            pageTable[set][way].valid = false;
             pageTable[set][way].tag = 0;
+            pageTable[set][way].regionWay = 0;
             pageTable[set][way].ctr = 0;
+        }
+    }
+
+    // Initialize region table
+    numRegionSets = numRegionEntries / numRegionWays;
+    assert(numRegionSets == 1);
+    regionTable.resize(numRegionSets);
+    for (unsigned set = 0; set < numRegionSets; ++set) {
+        regionTable[set].resize(numRegionWays);
+        for (unsigned way = 0; way < numRegionWays; ++way) {
+            regionTable[set][way].valid = false;
+            regionTable[set][way].tag = 0;
+            regionTable[set][way].ctr = 0;
         }
     }
 
@@ -77,6 +92,12 @@ BTBPDede::BTBPDede(const Params& p):
     pagePLRUTable.resize(numPageSets);
     for (unsigned set = 0; set < numPageSets; ++set) {
         pagePLRUTable[set] = 0;
+    }
+
+    // Initialize region plru table
+    regionPLRUTable.resize(numRegionSets);
+    for (unsigned set = 0; set < numRegionSets; ++set) {
+        regionPLRUTable[set] = 0;
     }
 
     // Initialize victim cache
@@ -97,9 +118,11 @@ BTBPDede::BTBPDede(const Params& p):
 
     DPRINTF(BTBPDede, "BTBPDede initialized: numEntries %d, numWays %d, numSets %d, "
         "tagBits %d, tagFoldedBits %d, pageBits %d, numPageEntries %d, "
-        "numPageWays %d, numPageSets %d\n",
+        "numPageWays %d, numPageSets %d, numRegionEntries %d, numRegionWays %d, "
+        "numRegionSets %d\n",
         numEntries, numWays, numSets, tagBits, tagFoldedBits, pageBits,
-        numPageEntries, numPageWays, numPageSets);
+        numPageEntries, numPageWays, numPageSets,
+        numRegionEntries, numRegionWays, numRegionSets);
 }
 
 BTBPDede::~BTBPDede()
@@ -131,29 +154,25 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
     Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.getOffsetBits() + instShiftAmt));
 
-    // Only access page table for cross-page entries that use page pointer
+    // For long targets, reconstruct with regionTag + pageTag + targetLower.
     if (entry.isUsePagePointer() && entry.isCrossPage) {
-        const auto &pageEntry =
-            pageTable[entry.pageTableSet][entry.extendedInfo.pageTableWay];
-
-        Addr pcUpper = pc & ~mask(pageBits + maxOffsetBits + instShiftAmt);
-        Addr pcUpperPlusOne = pcUpper + (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
-        Addr pcUpperMinusOne = pcUpper - (1ULL << (pageBits + maxOffsetBits + instShiftAmt));
+        if (entry.pageTableSet >= numPageSets || entry.extendedInfo.pageTableWay >= numPageWays) {
+            return targetLower;
+        }
+        const auto &pageEntry = pageTable[entry.pageTableSet][entry.extendedInfo.pageTableWay];
+        if (!pageEntry.valid || pageEntry.regionWay >= numRegionWays) {
+            return targetLower;
+        }
+        constexpr unsigned regionSet = 0;
+        const auto &regionEntry = regionTable[regionSet][pageEntry.regionWay];
+        if (!regionEntry.valid) {
+            return targetLower;
+        }
 
         Addr pageSection = pageEntry.tag << (maxOffsetBits + instShiftAmt);
-
-        if (carry.isFit()) {
-            fullTarget = pcUpper | pageSection | targetLower;
-        }
-        else if (carry.isPlusOne()) {
-            fullTarget = pcUpperPlusOne | pageSection | targetLower;
-        }
-        else if (carry.isMinusOne()){
-            fullTarget = pcUpperMinusOne | pageSection | targetLower;
-        }
-        else {
-            fullTarget = pageSection | targetLower; // invalid target
-        }
+        Addr regionSection =
+            regionEntry.tag << (pageBits + maxOffsetBits + instShiftAmt);
+        fullTarget = regionSection | pageSection | targetLower;
     }
     else {
         // Non-crossPage entries: use carry bits with pcMiddle
@@ -427,6 +446,10 @@ Addr BTBPDede::getPageTableIdx(Addr target) {
 Addr BTBPDede::getPageTableTag(Addr target) {
     Addr fullTag = target >> (maxOffsetBits + instShiftAmt);
     return fullTag & mask(pageBits);
+}
+
+Addr BTBPDede::getRegionTableTag(Addr target) {
+    return target >> (pageBits + maxOffsetBits + instShiftAmt);
 }
 
 Addr BTBPDede::getVictimCacheTag(Addr monitorTag, Addr monitorIdx)
@@ -764,6 +787,19 @@ void BTBPDede::update(const FetchTarget& stream) {
             pageTableIdx, currentPLRUState, touchedPLRUState);
     };
 
+    auto updateRegionPLRUState = [&](unsigned way) {
+        constexpr unsigned regionSet = 0;
+        unsigned currentPLRUState = regionPLRUTable[regionSet];
+        unsigned touchedPLRUState = getTouchedPLRUState(
+            currentPLRUState,
+            numRegionWays,
+            way
+        );
+        regionPLRUTable[regionSet] = touchedPLRUState;
+        DPRINTF(BTBPDede, "BTBPDede: touched region table PLRU state for set %d from %#x to %#x\n",
+            regionSet, currentPLRUState, touchedPLRUState);
+    };
+
     auto updateVictimCachePLRUState = [&](unsigned way) {
         unsigned currentVictimPLRUState = victimCachePLRUTable[alignedBankIdx];
         unsigned touchedVictimPLRUState = getTouchedPLRUState(
@@ -782,12 +818,6 @@ void BTBPDede::update(const FetchTarget& stream) {
         exec.target,
         maxOffsetBits
     );
-    TargetCarry longCarry = computeCarryBits(
-        exec.pc,
-        exec.target,
-        maxOffsetBits + pageBits
-    );
-
     bool isCrossPage = shortCarry.isNone();
 
     MonitorEntry newEntry;
@@ -799,17 +829,53 @@ void BTBPDede::update(const FetchTarget& stream) {
     newEntry.tag = monitorTag;
     newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
     newEntry.attr = execAttr;
-    newEntry.carry = (isCrossPage) ? longCarry : shortCarry;
+    newEntry.carry = shortCarry;
     newEntry.pageTableSet = pageTableIdx;
 
     // compute extended info
     if (isCrossPage) {
         stats.updateUsePagePointerTimes++;
 
+        Addr regionTableTag = getRegionTableTag(exec.target);
+
+        constexpr unsigned regionSet = 0;
+        unsigned regionTableWay = numRegionWays;
+        for (unsigned way = 0; way < numRegionWays; ++way) {
+            auto &regionEntry = regionTable[regionSet][way];
+            if (!regionEntry.valid) continue;
+            if (regionEntry.tag != regionTableTag) continue;
+
+            regionTableWay = way;
+            break;
+        }
+
+        if (regionTableWay == numRegionWays) {
+            for (unsigned way = 0; way < numRegionWays; ++way) {
+                auto &regionEntry = regionTable[regionSet][way];
+                if (!regionEntry.valid) {
+                    regionTableWay = way;
+                    break;
+                }
+            }
+        }
+
+        if (regionTableWay == numRegionWays) {
+            regionTableWay = getPLRUVictims(
+                regionPLRUTable[regionSet],
+                numRegionWays
+            )[0];
+        }
+
+        auto &regionEntry = regionTable[regionSet][regionTableWay];
+        regionEntry.valid = true;
+        regionEntry.tag = regionTableTag;
+        updateRegionPLRUState(regionTableWay);
+
         // check if page entry exists
-        Addr pageTableWay = -1;
+        unsigned pageTableWay = numPageWays;
         for (unsigned way = 0; way < numPageWays; ++way) {
             auto &pageEntry = pageTable[pageTableIdx][way];
+            if (!pageEntry.valid) continue;
             Addr entryTag = pageEntry.tag;
             if (entryTag != pageTableTag) continue;
 
@@ -817,7 +883,7 @@ void BTBPDede::update(const FetchTarget& stream) {
             break;
         }
         // page entry not exists
-        if (pageTableWay == -1) {
+        if (pageTableWay == numPageWays) {
             stats.updateAllocatePagePointerTimes++;
 
             // choose victim way using PLRU
@@ -828,6 +894,7 @@ void BTBPDede::update(const FetchTarget& stream) {
 
             // update page entry
             auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
+            pageEntry.valid = true;
             pageEntry.tag = getPageTableTag(exec.target);
 
             DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
@@ -835,6 +902,11 @@ void BTBPDede::update(const FetchTarget& stream) {
             DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
             printPageEntry(pageEntry);
         }
+
+        auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
+        pageEntry.valid = true;
+        pageEntry.tag = getPageTableTag(exec.target);
+        pageEntry.regionWay = regionTableWay;
 
         newEntry.extendedInfo.pageTableWay = pageTableWay;
         updatePagePLRUState(pageTableWay);
@@ -1003,8 +1075,8 @@ void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
 }
 
 void BTBPDede::printPageEntry(const PageEntry& e) {
-    DPRINTF(BTBPDede, "PageEntry: tag:%#lx, ctr:%d\n",
-        e.tag, e.ctr);
+    DPRINTF(BTBPDede, "PageEntry: valid:%d, tag:%#lx, regionWay:%#lx, ctr:%d\n",
+        e.valid, e.tag, e.regionWay, e.ctr);
 }
 
 void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)

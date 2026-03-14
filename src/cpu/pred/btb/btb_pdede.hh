@@ -116,13 +116,16 @@ private:
 
     struct PageEntry
     {
+        bool valid;
         Addr tag;
+        Addr regionWay;
         int ctr;
     };
     typedef std::vector<PageEntry> PageSet;
 
     struct RegionEntry
     {
+        bool valid;
         Addr tag;
         int ctr;
     };
@@ -148,6 +151,9 @@ private:
     std::vector<PageSet> pageTable;
     std::vector<unsigned> pagePLRUTable;    // page table PLRU replacement table
 
+    std::vector<RegionSet> regionTable;
+    std::vector<unsigned> regionPLRUTable;  // region table PLRU replacement table
+
     std::vector<MonitorSet> victimCache;
     std::vector<unsigned> victimCachePLRUTable;
     // std::vector<RegionSet> regionTable; // TODO: implement region table
@@ -166,6 +172,7 @@ private:
 
     Addr getPageTableIdx(Addr target);
     Addr getPageTableTag(Addr target);
+    Addr getRegionTableTag(Addr target);
 
     Addr getVictimCacheTag(Addr monitorTag, Addr monitorIdx);
 
