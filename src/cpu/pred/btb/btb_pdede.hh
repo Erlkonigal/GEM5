@@ -1,6 +1,8 @@
 #ifndef __CPU_PRED_BTB_PDEDE_HH__
 #define __CPU_PRED_BTB_PDEDE_HH__
 
+#include <cstdint>
+
 #include "base/types.hh"
 #include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
@@ -44,6 +46,8 @@ private:
 
     // TODO: offset bits need profiling to decide
     static constexpr unsigned maxOffsetBits = 11;
+    static constexpr uint8_t maxRRPV = 3;
+    static constexpr uint8_t insertRRPV = 2;
 
     struct BranchAttribute
     {
@@ -92,21 +96,27 @@ private:
         Addr tag;
         Addr targetOffset; // target low bits
         BranchAttribute attr;
-        TargetCarry carry;
+        uint8_t rrpv;
 
         Addr pageTableSet;
-        union ExtInfo
-        {
-            Addr pageTableWay; // used as long target with page pointer
-            int8_t ctr;        // used as conditional short target prediction counter, range [-2, 1]
-        } extendedInfo;
+        unsigned pageTableWay; // used as long target with page pointer
+        int8_t ctr;            // used as conditional short target prediction counter, range [-2, 1]
+        TargetCarry targetCarry;
 
 
         MonitorEntry() : offsetBits(maxOffsetBits), usePagePointer(true), valid(false),
-            isCrossPage(false), alwaysTaken(true), isRVC(true) {}
+            isCrossPage(false), alwaysTaken(true), isRVC(true), rrpv(maxRRPV),
+            pageTableSet(0), pageTableWay(0), ctr(0)
+        {
+            targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
+        }
         MonitorEntry(int offsetBits, bool usePagePointer)
             : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false),
-              isCrossPage(false), alwaysTaken(true), isRVC(true) {}
+              isCrossPage(false), alwaysTaken(true), isRVC(true), rrpv(maxRRPV),
+              pageTableSet(0), pageTableWay(0), ctr(0)
+        {
+            targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
+        }
 
         int getOffsetBits() const { return offsetBits; }
         bool isUsePagePointer() const { return usePagePointer; }
@@ -119,7 +129,7 @@ private:
         bool valid;
         Addr tag;
         Addr regionWay;
-        int ctr;
+        uint8_t rrpv;
     };
     typedef std::vector<PageEntry> PageSet;
 
@@ -127,7 +137,7 @@ private:
     {
         bool valid;
         Addr tag;
-        int ctr;
+        uint8_t rrpv;
     };
     typedef std::vector<RegionEntry> RegionSet;
 
@@ -138,33 +148,20 @@ private:
     };
     // typedef std::vector<MonitorSet> BTBPDedeMeta;
 
-    typedef std::vector<unsigned> ReplacementAlignBank;
-
     std::shared_ptr<BTBPDedeMeta> meta;
 
     // sram implementation
     std::vector<MonitorAlignBank> monitorTable;
 
-    // register implementation
-    std::vector<ReplacementAlignBank> monitorPLRUTable; // PLRU replacement table
-
     std::vector<PageSet> pageTable;
-    std::vector<unsigned> pagePLRUTable;    // page table PLRU replacement table
 
     std::vector<RegionSet> regionTable;
-    std::vector<unsigned> regionPLRUTable;  // region table PLRU replacement table
 
     std::vector<MonitorSet> victimCache;
-    std::vector<unsigned> victimCachePLRUTable;
-    // std::vector<RegionSet> regionTable; // TODO: implement region table
 
     unsigned getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx);
     Addr getFullTarget(Addr pc, const MonitorEntry &entry);
     TargetCarry computeCarryBits(Addr pc, Addr target, unsigned offsetBits);
-
-    std::vector<unsigned> getPLRUVictims(unsigned state, unsigned numWays);
-    unsigned getTouchedPLRUState(unsigned state, unsigned numWays, unsigned touchWay);
-    unsigned getMakeVictimPLRUState(unsigned state, unsigned numWays, unsigned victimWay);
 
     Addr getMonitorIdx(Addr pc);
     Addr getMonitorTag(Addr pc);

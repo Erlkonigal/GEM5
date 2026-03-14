@@ -5,6 +5,46 @@ namespace gem5 {
 namespace branch_prediction {
 namespace btb_pred {
 
+namespace {
+
+constexpr uint8_t kMaxRRPV = 3;
+
+uint8_t
+srripTouch()
+{
+    return 0;
+}
+
+template <class SetType>
+unsigned
+findOrSelectSRRIPWay(SetType &set)
+{
+    if (set.empty()) {
+        return 0;
+    }
+
+    for (unsigned way = 0; way < set.size(); ++way) {
+        if (!set[way].valid) {
+            return way;
+        }
+    }
+
+    while (true) {
+        for (unsigned way = 0; way < set.size(); ++way) {
+            if (set[way].rrpv == kMaxRRPV) {
+                return way;
+            }
+        }
+        for (auto &entry : set) {
+            if (entry.rrpv < kMaxRRPV) {
+                entry.rrpv++;
+            }
+        }
+    }
+}
+
+} // anonymous namespace
+
 BTBPDede::BTBPDede(const Params& p):
     TimedBaseBTBPredictor(p),
     instShiftAmt(p.instShiftAmt),
@@ -62,7 +102,7 @@ BTBPDede::BTBPDede(const Params& p):
             pageTable[set][way].valid = false;
             pageTable[set][way].tag = 0;
             pageTable[set][way].regionWay = 0;
-            pageTable[set][way].ctr = 0;
+            pageTable[set][way].rrpv = maxRRPV;
         }
     }
 
@@ -75,29 +115,8 @@ BTBPDede::BTBPDede(const Params& p):
         for (unsigned way = 0; way < numRegionWays; ++way) {
             regionTable[set][way].valid = false;
             regionTable[set][way].tag = 0;
-            regionTable[set][way].ctr = 0;
+            regionTable[set][way].rrpv = maxRRPV;
         }
-    }
-
-    // Initialize monitor plru table
-    monitorPLRUTable.resize(numAlignBanks);
-    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
-        monitorPLRUTable[bank].resize(numSets);
-        for (unsigned set = 0; set < numSets; ++set) {
-            monitorPLRUTable[bank][set] = 0;
-        }
-    }
-
-    // Initialize page plru table
-    pagePLRUTable.resize(numPageSets);
-    for (unsigned set = 0; set < numPageSets; ++set) {
-        pagePLRUTable[set] = 0;
-    }
-
-    // Initialize region plru table
-    regionPLRUTable.resize(numRegionSets);
-    for (unsigned set = 0; set < numRegionSets; ++set) {
-        regionPLRUTable[set] = 0;
     }
 
     // Initialize victim cache
@@ -108,11 +127,6 @@ BTBPDede::BTBPDede(const Params& p):
         for (unsigned set = 0; set < numVictimCacheSets; ++set) {
             victimCache[bank].emplace_back(20, false);
         }
-    }
-
-    victimCachePLRUTable.resize(numAlignBanks);
-    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
-        victimCachePLRUTable[bank] = 0;
     }
 
 
@@ -148,7 +162,7 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
     Addr targetLower = entry.targetOffset << instShiftAmt;
 
     Addr fullTarget = 0;
-    TargetCarry carry = entry.carry;
+    TargetCarry carry = entry.targetCarry;
 
     Addr pcMiddle = pc & ~mask(entry.getOffsetBits() + instShiftAmt);
     Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
@@ -156,10 +170,10 @@ Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
 
     // For long targets, reconstruct with regionTag + pageTag + targetLower.
     if (entry.isUsePagePointer() && entry.isCrossPage) {
-        if (entry.pageTableSet >= numPageSets || entry.extendedInfo.pageTableWay >= numPageWays) {
+        if (entry.pageTableSet >= numPageSets || entry.pageTableWay >= numPageWays) {
             return targetLower;
         }
-        const auto &pageEntry = pageTable[entry.pageTableSet][entry.extendedInfo.pageTableWay];
+        const auto &pageEntry = pageTable[entry.pageTableSet][entry.pageTableWay];
         if (!pageEntry.valid || pageEntry.regionWay >= numRegionWays) {
             return targetLower;
         }
@@ -221,150 +235,6 @@ BTBPDede::TargetCarry BTBPDede::computeCarryBits(Addr pc, Addr target, unsigned 
 
     stats.carryOverflowTimes += carry.isNone();
     return carry;
-}
-
-/*                bits storage example for 8-way PLRU binary tree:
- *                      bit[6]: ways 7-4 older than ways 3-0
- *                      /                                  \
- *            bit[5]: ways 7+6 > 5+4                bit[2]: ways 3+2 > 1+0
- *            /                    \                /                    \
- *     bit[4]: way 7>6    bit[3]: way 5>4    bit[1]: way 3>2    bit[0]: way 1>0
- */
-std::vector<unsigned> BTBPDede::getPLRUVictims(unsigned state, unsigned numWays)
-{
-    assert(isPowerOf2(numWays));
-
-    std::vector<unsigned> ways;
-
-    if (numWays > 2) {
-        unsigned rightWays = numWays / 2;
-        unsigned leftWays = numWays - rightWays;
-        unsigned leftSubtreeOlder = (state >> (numWays - 2)) & 0x1;
-        unsigned leftSubtreeState = (state >> (rightWays - 1)) & mask(leftWays - 1);
-        unsigned rightSubtreeState = state & mask(rightWays - 1);
-
-        assert(leftWays == rightWays); // numWays is power of 2
-
-        auto leftVictims = getPLRUVictims(leftSubtreeState, leftWays);
-        auto rightVictims = getPLRUVictims(rightSubtreeState, rightWays);
-
-        if (leftSubtreeOlder) {
-            for (auto w : leftVictims) {
-                ways.push_back(w | (1 << floorLog2(leftWays)));
-            }
-            for (auto w : rightVictims) {
-                ways.push_back(w & ~(1 << floorLog2(rightWays)));
-            }
-        }
-        else {
-            for (auto w : rightVictims) {
-                ways.push_back(w & ~(1 << floorLog2(rightWays)));
-            }
-            for (auto w : leftVictims) {
-                ways.push_back(w | (1 << floorLog2(leftWays)));
-            }
-        }
-    }
-    else if (numWays == 2) {
-        ways.push_back(state & 0x1);
-        ways.push_back(!(state & 0x1));
-    }
-    else {
-        assert(false); // should not reach here
-    }
-
-    return ways;
-}
-
-unsigned BTBPDede::getTouchedPLRUState(unsigned state, unsigned numWays, unsigned touchWay) {
-    assert(isPowerOf2(numWays));
-
-    unsigned touchedState = 0;
-
-    if (numWays > 2) {
-        unsigned rightWays = numWays / 2;
-        unsigned leftWays = numWays - rightWays;
-        unsigned setLeftOlder = !((touchWay >> (floorLog2(numWays) - 1)) & 0x1);
-        unsigned leftSubtreeState = (state >> (rightWays - 1)) & mask(leftWays - 1);
-        unsigned rightSubtreeState = state & mask(rightWays - 1);
-
-        if (setLeftOlder) {
-            unsigned touchedRightState = getTouchedPLRUState(
-                rightSubtreeState,
-                rightWays,
-                touchWay & mask(floorLog2(rightWays))
-            );
-            touchedState |= (1 << (numWays - 2)); // set left older bit
-            touchedState |= leftSubtreeState << (rightWays - 1);
-            touchedState |= touchedRightState;
-        }
-        else {
-            unsigned touchedLeftState = getTouchedPLRUState(
-                leftSubtreeState,
-                leftWays,
-                touchWay & mask(floorLog2(leftWays))
-            );
-            touchedState &= ~(1 << (numWays - 2)); // clear left older bit
-            touchedState |= touchedLeftState << (rightWays - 1);
-            touchedState |= rightSubtreeState;
-        }
-
-    }
-    else if (numWays == 2) {
-        touchedState = !(touchWay & 0x1);
-    }
-    else {
-        assert(false); // should not reach here
-    }
-
-    assert(touchedState < (1 << (numWays - 1)));
-
-    return touchedState;
-}
-
-unsigned BTBPDede::getMakeVictimPLRUState(unsigned state, unsigned numWays, unsigned victimWay) {
-    assert(isPowerOf2(numWays));
-
-    unsigned victimizedState = 0;
-
-    if (numWays > 2) {
-        unsigned rightWays = numWays / 2;
-        unsigned leftWays = numWays - rightWays;
-        unsigned setLeftOlder = (victimWay >> (floorLog2(numWays) - 1)) & 0x1;
-        unsigned leftSubtreeState = (state >> (rightWays - 1)) & mask(leftWays - 1);
-        unsigned rightSubtreeState = state & mask(rightWays - 1);
-
-        if (setLeftOlder) {
-            unsigned victimizedLeftState = getMakeVictimPLRUState(
-                leftSubtreeState,
-                leftWays,
-                victimWay & mask(floorLog2(leftWays))
-            );
-            victimizedState |= (1 << (numWays - 2)); // set left older bit
-            victimizedState |= victimizedLeftState << (rightWays - 1);
-            victimizedState |= rightSubtreeState;
-        }
-        else {
-            unsigned victimizedRightState = getMakeVictimPLRUState(
-                rightSubtreeState,
-                rightWays,
-                victimWay & mask(floorLog2(rightWays))
-            );
-            victimizedState &= ~(1 << (numWays - 2)); // clear left older bit
-            victimizedState |= leftSubtreeState << (rightWays - 1);
-            victimizedState |= victimizedRightState;
-        }
-    }
-    else if (numWays == 2) {
-        victimizedState = (victimWay & 0x1);
-    }
-    else {
-        assert(false); // should not reach here
-    }
-
-    assert(victimizedState < (1 << (numWays - 1)));
-
-    return victimizedState;
 }
 
 Addr BTBPDede::getMonitorIdx(Addr pc)
@@ -521,7 +391,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             }
             if (btbEntry.isCond && !entry.isCrossPage) {
                 btbEntry.alwaysTaken = entry.alwaysTaken;
-                btbEntry.ctr = entry.extendedInfo.ctr;
+                btbEntry.ctr = entry.ctr;
             }
             btbEntries.push_back(btbEntry);
             DPRINTF(BTBPDede, "BTBPDede: found valid BTB entry pc %#lx target %#lx\n",
@@ -530,42 +400,22 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
                 btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn);
 
             if (way >= numWays) {
-                // update victim cache PLRU state
-                unsigned currentVictimPLRUState = victimCachePLRUTable[phyBankIdx];
-                unsigned touchedVictimPLRUState = getTouchedPLRUState(
-                    currentVictimPLRUState,
-                    numVictimCacheSets,
-                    way - numWays
-                );
-                victimCachePLRUTable[phyBankIdx] = touchedVictimPLRUState;
-                DPRINTF(BTBPDede, "BTBPDede: touched victim cache PLRU state for bank %d from %#x to %#x\n",
-                    phyBankIdx, currentVictimPLRUState, touchedVictimPLRUState);
+                victimCache[phyBankIdx][way - numWays].rrpv = srripTouch();
                 continue;
             }
 
-            // update entry PLRU state
-            unsigned currentPLRUState = monitorPLRUTable[phyBankIdx][monitorIdx];
-            unsigned touchedPLRUState = getTouchedPLRUState(
-                currentPLRUState,
-                numWays,
-                way
-            );
-            monitorPLRUTable[phyBankIdx][monitorIdx] = touchedPLRUState;
-            DPRINTF(BTBPDede, "BTBPDede: touched monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
-                phyBankIdx, monitorIdx, currentPLRUState, touchedPLRUState);
+            monitorTable[phyBankIdx][monitorIdx][way].rrpv = srripTouch();
 
-            // update page table LRU state if using page pointer
             if (entry.isUsePagePointer() && entry.isCrossPage) {
                 Addr pageTableIdx = entry.pageTableSet;
-                unsigned currentPagePLRUState = pagePLRUTable[pageTableIdx];
-                unsigned touchedPagePLRUState = getTouchedPLRUState(
-                    currentPagePLRUState,
-                    numPageWays,
-                    entry.extendedInfo.pageTableWay
-                );
-                pagePLRUTable[pageTableIdx] = touchedPagePLRUState;
-                DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
-                    pageTableIdx, currentPagePLRUState, touchedPagePLRUState);
+                if (pageTableIdx < numPageSets && entry.pageTableWay < numPageWays) {
+                    auto &pageEntry = pageTable[pageTableIdx][entry.pageTableWay];
+                    pageEntry.rrpv = srripTouch();
+                    constexpr unsigned regionSet = 0;
+                    if (pageEntry.regionWay < numRegionWays) {
+                        regionTable[regionSet][pageEntry.regionWay].rrpv = srripTouch();
+                    }
+                }
             }
         }
 
@@ -735,7 +585,7 @@ void BTBPDede::update(const FetchTarget& stream) {
     });
 
     // find entry already hit in monitor table
-    unsigned foundWay = -1;
+    unsigned foundWay = numWays;
     for (unsigned way = 0; way < numWays; ++way) {
         auto &entry = toUpdate[way];
         if (!entry.valid) continue; // skip invalid entries
@@ -748,7 +598,7 @@ void BTBPDede::update(const FetchTarget& stream) {
     }
 
     // find entry already hit in victim cache
-    unsigned foundVictimWay = -1;
+    unsigned foundVictimWay = numVictimCacheSets;
     for (unsigned way = 0; way < numVictimCacheSets; ++way) {
         auto &entry = victimCache[alignedBankIdx][way];
         Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
@@ -761,56 +611,6 @@ void BTBPDede::update(const FetchTarget& stream) {
         stats.updateHitVictimTimes++;
         break;
     }
-
-    // helper functions for update
-    auto updateMonitorPLRUState = [&] (unsigned way) {
-        unsigned currentPLRUState = monitorPLRUTable[alignedBankIdx][monitorIdx];
-        unsigned touchedPLRUState = getTouchedPLRUState(
-            currentPLRUState,
-            numWays,
-            way
-        );
-        monitorPLRUTable[alignedBankIdx][monitorIdx] = touchedPLRUState;
-        DPRINTF(BTBPDede, "BTBPDede: touched monitor PLRU state for bank %d idx %#lx from %#x to %#x\n",
-            alignedBankIdx, monitorIdx, currentPLRUState, touchedPLRUState);
-    };
-
-    auto updatePagePLRUState = [&](unsigned way) {
-        unsigned currentPLRUState = pagePLRUTable[pageTableIdx];
-        unsigned touchedPLRUState = getTouchedPLRUState(
-            currentPLRUState,
-            numPageWays,
-            way
-        );
-        pagePLRUTable[pageTableIdx] = touchedPLRUState;
-        DPRINTF(BTBPDede, "BTBPDede: touched page table PLRU state for idx %#lx from %#x to %#x\n",
-            pageTableIdx, currentPLRUState, touchedPLRUState);
-    };
-
-    auto updateRegionPLRUState = [&](unsigned way) {
-        constexpr unsigned regionSet = 0;
-        unsigned currentPLRUState = regionPLRUTable[regionSet];
-        unsigned touchedPLRUState = getTouchedPLRUState(
-            currentPLRUState,
-            numRegionWays,
-            way
-        );
-        regionPLRUTable[regionSet] = touchedPLRUState;
-        DPRINTF(BTBPDede, "BTBPDede: touched region table PLRU state for set %d from %#x to %#x\n",
-            regionSet, currentPLRUState, touchedPLRUState);
-    };
-
-    auto updateVictimCachePLRUState = [&](unsigned way) {
-        unsigned currentVictimPLRUState = victimCachePLRUTable[alignedBankIdx];
-        unsigned touchedVictimPLRUState = getTouchedPLRUState(
-            currentVictimPLRUState,
-            numVictimCacheSets,
-            way
-        );
-        victimCachePLRUTable[alignedBankIdx] = touchedVictimPLRUState;
-        DPRINTF(BTBPDede, "BTBPDede: touched victim cache PLRU state for bank %d from %#x to %#x\n",
-            alignedBankIdx, currentVictimPLRUState, touchedVictimPLRUState);
-    };
 
     // build new entry
     TargetCarry shortCarry = computeCarryBits(
@@ -829,50 +629,42 @@ void BTBPDede::update(const FetchTarget& stream) {
     newEntry.tag = monitorTag;
     newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
     newEntry.attr = execAttr;
-    newEntry.carry = shortCarry;
+    newEntry.targetCarry = shortCarry;
+    newEntry.rrpv = insertRRPV;
     newEntry.pageTableSet = pageTableIdx;
 
-    // compute extended info
+    // compute long/short metadata
     if (isCrossPage) {
         stats.updateUsePagePointerTimes++;
+        newEntry.targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
 
         Addr regionTableTag = getRegionTableTag(exec.target);
 
         constexpr unsigned regionSet = 0;
         unsigned regionTableWay = numRegionWays;
+        bool regionHit = false;
         for (unsigned way = 0; way < numRegionWays; ++way) {
             auto &regionEntry = regionTable[regionSet][way];
             if (!regionEntry.valid) continue;
             if (regionEntry.tag != regionTableTag) continue;
 
             regionTableWay = way;
+            regionHit = true;
             break;
         }
 
         if (regionTableWay == numRegionWays) {
-            for (unsigned way = 0; way < numRegionWays; ++way) {
-                auto &regionEntry = regionTable[regionSet][way];
-                if (!regionEntry.valid) {
-                    regionTableWay = way;
-                    break;
-                }
-            }
-        }
-
-        if (regionTableWay == numRegionWays) {
-            regionTableWay = getPLRUVictims(
-                regionPLRUTable[regionSet],
-                numRegionWays
-            )[0];
+            regionTableWay = findOrSelectSRRIPWay(regionTable[regionSet]);
         }
 
         auto &regionEntry = regionTable[regionSet][regionTableWay];
         regionEntry.valid = true;
         regionEntry.tag = regionTableTag;
-        updateRegionPLRUState(regionTableWay);
+        regionEntry.rrpv = regionHit ? srripTouch() : insertRRPV;
 
         // check if page entry exists
         unsigned pageTableWay = numPageWays;
+        bool pageHit = false;
         for (unsigned way = 0; way < numPageWays; ++way) {
             auto &pageEntry = pageTable[pageTableIdx][way];
             if (!pageEntry.valid) continue;
@@ -880,17 +672,14 @@ void BTBPDede::update(const FetchTarget& stream) {
             if (entryTag != pageTableTag) continue;
 
             pageTableWay = way;
+            pageHit = true;
             break;
         }
         // page entry not exists
         if (pageTableWay == numPageWays) {
             stats.updateAllocatePagePointerTimes++;
 
-            // choose victim way using PLRU
-            pageTableWay = getPLRUVictims(
-                pagePLRUTable[pageTableIdx],
-                numPageWays
-            )[0];
+            pageTableWay = findOrSelectSRRIPWay(pageTable[pageTableIdx]);
 
             // update page entry
             auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
@@ -907,23 +696,23 @@ void BTBPDede::update(const FetchTarget& stream) {
         pageEntry.valid = true;
         pageEntry.tag = getPageTableTag(exec.target);
         pageEntry.regionWay = regionTableWay;
+        pageEntry.rrpv = pageHit ? srripTouch() : insertRRPV;
 
-        newEntry.extendedInfo.pageTableWay = pageTableWay;
-        updatePagePLRUState(pageTableWay);
+        newEntry.pageTableWay = pageTableWay;
     }
     else {
         // Initialize counter for non-crossPage conditional branches
-        newEntry.extendedInfo.ctr = 0;
+        newEntry.ctr = 0;
     }
 
     // Update counter for conditional branches (only for non-crossPage entries)
     if (!isCrossPage && execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
         // Preserve existing ctr value from the found entry
-        if (foundWay != -1) {
-            newEntry.extendedInfo.ctr = toUpdate[foundWay].extendedInfo.ctr;
+        if (foundWay != numWays) {
+            newEntry.ctr = toUpdate[foundWay].ctr;
             newEntry.alwaysTaken = toUpdate[foundWay].alwaysTaken;
-        } else if (foundVictimWay != -1) {
-            newEntry.extendedInfo.ctr = victimCache[alignedBankIdx][foundVictimWay].extendedInfo.ctr;
+        } else if (foundVictimWay != numVictimCacheSets) {
+            newEntry.ctr = victimCache[alignedBankIdx][foundVictimWay].ctr;
             newEntry.alwaysTaken = victimCache[alignedBankIdx][foundVictimWay].alwaysTaken;
         }
 
@@ -933,37 +722,35 @@ void BTBPDede::update(const FetchTarget& stream) {
         }
         if (!newEntry.alwaysTaken) {
             // Update 2-bit saturating counter, range [-2, 1]
-            if (this_cond_taken && newEntry.extendedInfo.ctr < 1) {
-                newEntry.extendedInfo.ctr++;
+            if (this_cond_taken && newEntry.ctr < 1) {
+                newEntry.ctr++;
             }
-            if (!this_cond_taken && newEntry.extendedInfo.ctr > -2) {
-                newEntry.extendedInfo.ctr--;
+            if (!this_cond_taken && newEntry.ctr > -2) {
+                newEntry.ctr--;
             }
         }
     }
 
-    if (foundWay != -1) {
+    if (foundWay != numWays) {
         toUpdate[foundWay] = newEntry;
+        toUpdate[foundWay].rrpv = srripTouch();
 
         DPRINTF(BTBPDede, "BTBPDede: updated existing monitor entry at bank %d, index %d, way %d\n",
             alignedBankIdx, monitorIdx, foundWay);
 
-        updateMonitorPLRUState(foundWay);
-
         // deduplicate victim cache if foundVictimWay also hits
-        if (foundVictimWay != -1) {
+        if (foundVictimWay != numVictimCacheSets) {
             DPRINTF(BTBPDede, "BTBPDede: deduplicating victim cache entry at bank %d, way %d\n",
                 alignedBankIdx, foundVictimWay);
             victimCache[alignedBankIdx][foundVictimWay].valid = false;
         }
     }
-    else if (foundVictimWay != -1) {
+    else if (foundVictimWay != numVictimCacheSets) {
         // in-place update existing victim cache entry
         auto &victimEntry = victimCache[alignedBankIdx][foundVictimWay];
         victimEntry = newEntry;
         victimEntry.tag = getVictimCacheTag(monitorTag, monitorIdx);
-
-        updateVictimCachePLRUState(foundVictimWay);
+        victimEntry.rrpv = srripTouch();
 
         DPRINTF(BTBPDede, "BTBPDede: updated existing victim cache entry at bank %d, way %d\n",
             alignedBankIdx, foundVictimWay);
@@ -979,7 +766,7 @@ void BTBPDede::update(const FetchTarget& stream) {
 
         stats.updateMissTimes++;
 
-        unsigned evictWay = -1;
+        unsigned evictWay = numWays;
 
         // firstly try to find invalid entry
         for (unsigned i = 0; i < numWays; ++i) {
@@ -992,15 +779,9 @@ void BTBPDede::update(const FetchTarget& stream) {
             }
         }
 
-        if (evictWay == -1) {
+        if (evictWay == numWays) {
             stats.updateEvictTimes++;
-            // no invalid entry, use PLRU to choose victim
-            evictWay = getPLRUVictims(
-                monitorPLRUTable[alignedBankIdx][monitorIdx],
-                numWays
-            )[0];
-
-            updateMonitorPLRUState(evictWay);
+            evictWay = findOrSelectSRRIPWay(toUpdate);
 
             DPRINTF(BTBPDede, "BTBPDede: evicting way %d for bank %d idx %#lx\n",
                 evictWay, alignedBankIdx, monitorIdx);
@@ -1011,7 +792,7 @@ void BTBPDede::update(const FetchTarget& stream) {
         // evict to victim cache
         if (toEvictEntry.valid && victimCacheEntries != 0) {
             // insert evicted entry into victim cache
-            unsigned victimWay = -1;
+            unsigned victimWay = numVictimCacheSets;
             for (unsigned way = 0; way < numVictimCacheSets; way++) {
                 auto &victimEntry = victimCache[alignedBankIdx][way];
                 // find invalid entry first
@@ -1028,24 +809,20 @@ void BTBPDede::update(const FetchTarget& stream) {
                 break;
             }
 
-            if (victimWay == -1) {
-                // no invalid entry, use victim cache PLRU to choose victim
-                victimWay = getPLRUVictims(
-                    victimCachePLRUTable[alignedBankIdx],
-                    numVictimCacheSets
-                )[0];
+            if (victimWay == numVictimCacheSets) {
+                victimWay = findOrSelectSRRIPWay(victimCache[alignedBankIdx]);
                 DPRINTF(BTBPDede, "BTBPDede: evicting victim cache way %d for bank %d\n",
                     victimWay, alignedBankIdx);
-
-                updateVictimCachePLRUState(victimWay);
             }
 
             auto &victimEntry = victimCache[alignedBankIdx][victimWay];
             victimEntry = toEvictEntry;
             victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
+            victimEntry.rrpv = insertRRPV;
         }
 
         toUpdate[evictWay] = newEntry;
+        toUpdate[evictWay].rrpv = insertRRPV;
     }
 }
 
@@ -1067,16 +844,16 @@ void BTBPDede::dumpBTBEntries(const std::vector<BTBEntry>& es) {
 void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
     DPRINTF(BTBPDede, "MonitorEntry: offsetBits:%d, usePagePointer:%d, valid:%d, isCrossPage:%d, "
         "position:%d, tag:%#lx, targetOffset:%#lx, pagePointerSet:%#lx, "
-        "extInfo:%#lx, carry:%d, attr:(branchType:%d, rasAction:%d)\n",
+        "pagePointerWay:%u, ctr:%d, carry:%d, rrpv:%u, attr:(branchType:%d, rasAction:%d)\n",
         e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
         e.position, e.tag, e.targetOffset, e.pageTableSet,
-        e.extendedInfo.pageTableWay, (int)e.carry.targetCarry,
+        e.pageTableWay, e.ctr, (int)e.targetCarry.targetCarry, e.rrpv,
         (int)e.attr.branchType, (int)e.attr.rasAction);
 }
 
 void BTBPDede::printPageEntry(const PageEntry& e) {
-    DPRINTF(BTBPDede, "PageEntry: valid:%d, tag:%#lx, regionWay:%#lx, ctr:%d\n",
-        e.valid, e.tag, e.regionWay, e.ctr);
+    DPRINTF(BTBPDede, "PageEntry: valid:%d, tag:%#lx, regionWay:%#lx, rrpv:%u\n",
+        e.valid, e.tag, e.regionWay, e.rrpv);
 }
 
 void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)
@@ -1189,7 +966,7 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
                             found_raw_entry = true;
                             entry_cross_page = me.isCrossPage;
                             entry_use_page_pointer = me.isUsePagePointer();
-                            entry_carry = me.carry.targetCarry;
+                            entry_carry = me.targetCarry.targetCarry;
                             break;
                         }
                     }
@@ -1217,7 +994,7 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
                     } else if (found_raw_entry) {
                         stats.indirectPredWrongNonCrossPage++;
                     }
-                    if (found_raw_entry) {
+                    if (found_raw_entry && !entry_cross_page) {
                         switch (entry_carry) {
                           case TargetCarry::TargetCarryEnum::Fit:
                             stats.indirectPredWrongCarryFit++;
@@ -1233,6 +1010,8 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
                             stats.indirectPredWrongCarryNone++;
                             break;
                         }
+                    }
+                    if (found_raw_entry) {
                         if (entry_use_page_pointer) {
                             stats.indirectPredWrongUsePagePointer++;
                         } else {
