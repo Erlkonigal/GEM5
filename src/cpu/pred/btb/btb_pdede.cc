@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "btb_pdede.hh"
 #include "cpu/o3/dyn_inst.hh"
 
@@ -531,298 +533,323 @@ void BTBPDede::putPCHistory(
     fillStagePredictions(processed_entries, stagePreds);
 }
 
+std::vector<BTBEntry>
+BTBPDede::prepareUpdateEntries(const FetchTarget &stream)
+{
+    auto all_entries = stream.updateBTBEntries;
+
+    if (!stream.updateIsOldEntry) {
+        BTBEntry potential_new_entry = stream.updateNewBTBEntry;
+        bool new_entry_taken =
+            stream.exeTaken && stream.getControlPC() == potential_new_entry.pc;
+        if (!new_entry_taken) {
+            potential_new_entry.alwaysTaken = false;
+        }
+        all_entries.push_back(potential_new_entry);
+    }
+
+    if (getResolvedUpdate()) {
+        auto remove_it = std::remove_if(
+            all_entries.begin(),
+            all_entries.end(),
+            [](const BTBEntry &e) { return !e.resolved; });
+        all_entries.erase(remove_it, all_entries.end());
+    }
+
+    return all_entries;
+}
+
+void
+BTBPDede::checkPredictionHit(const FetchTarget &stream,
+                             const BTBPDede::BTBPDedeMeta *meta)
+{
+    bool pred_branch_hit = false;
+    for (const auto &e : meta->btbEntries) {
+        if (stream.exeBranchInfo == e) {
+            pred_branch_hit = true;
+            break;
+        }
+    }
+
+    if (!pred_branch_hit && stream.exeTaken) {
+        stats.updateMiss++;
+    } else {
+        stats.updateHit++;
+    }
+}
+
 void BTBPDede::update(const FetchTarget& stream) {
     DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
 
-    // Update on normal commit path as well, not only control-squash recovery.
-    // The caller already gates updates to meaningful targets.
-
-    // For conditional branches, we need to update even when not taken
-    // to maintain the counter and alwaysTaken flag
-    if (!stream.exeTaken && !stream.exeBranchInfo.isCond) {
-        DPRINTF(BTBPDede, "BTBPDede: update skipped due to not taken unconditional branch\n");
-        return;
-    }
-
     stats.updateTimes++;
 
-    auto metaFromUpdate =
+    auto meta_from_update =
         std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
+    checkPredictionHit(stream, meta_from_update.get());
 
-    BranchInfo exec = stream.exeBranchInfo;
-    unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
-    unsigned monitorIdx = getMonitorIdx(exec.pc);
-    unsigned monitorTag = getMonitorTag(exec.pc);
-    unsigned pageTableIdx = getPageTableIdx(exec.target);
-    unsigned pageTableTag = getPageTableTag(exec.target);
+    auto entries_need_update = prepareUpdateEntries(stream);
+    for (const auto &entry_to_update : entries_need_update) {
+        BranchInfo exec = entry_to_update;
+        unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
+        unsigned monitorIdx = getMonitorIdx(exec.pc);
+        unsigned monitorTag = getMonitorTag(exec.pc);
+        unsigned pageTableIdx = getPageTableIdx(exec.target);
+        unsigned pageTableTag = getPageTableTag(exec.target);
 
-    // Detect instruction size and calculate position
-    bool isRVC = (exec.size == 2);
-    unsigned offset = exec.pc & (blockSize - 1);
+        bool isRVC = (exec.size == 2);
+        unsigned offset = exec.pc & (blockSize - 1);
+        unsigned alignedPosition = isRVC ? (offset >> 1) : ((offset + 2) >> 1);
 
-    // Note: Cross-block 4-byte instructions are supported
-    // Position encoding correctly handles the offset=30 case
+        auto &toUpdate = monitorTable[alignedBankIdx][monitorIdx];
 
-    // Calculate position: points to the last 2 bytes of the instruction
-    unsigned alignedPosition;
-    if (isRVC) {
-        // 2-byte instruction: position = offset / 2
-        alignedPosition = offset >> 1;
-    } else {
-        // 4-byte instruction: position = (offset + 2) / 2
-        alignedPosition = (offset + 2) >> 1;
-    }
+        BranchAttribute execAttr({
+            exec.isCond ? BranchAttribute::BranchTypeEnum::Conditional :
+                (exec.isIndirect ? BranchAttribute::BranchTypeEnum::Indirect :
+                    BranchAttribute::BranchTypeEnum::Direct),
+            exec.isReturn ? BranchAttribute::RasActionEnum::Pop :
+                (exec.isCall ? BranchAttribute::RasActionEnum::Push :
+                    BranchAttribute::RasActionEnum::None)
+        });
 
-    auto &toUpdate = monitorTable[alignedBankIdx][monitorIdx];
-
-    BranchAttribute execAttr({
-        exec.isCond ? BranchAttribute::BranchTypeEnum::Conditional :
-            (exec.isIndirect ? BranchAttribute::BranchTypeEnum::Indirect :
-                BranchAttribute::BranchTypeEnum::Direct),
-        exec.isReturn ? BranchAttribute::RasActionEnum::Pop :
-            (exec.isCall ? BranchAttribute::RasActionEnum::Push :
-                BranchAttribute::RasActionEnum::None)
-    });
-
-    // find entry already hit in monitor table
-    unsigned foundWay = numWays;
-    for (unsigned way = 0; way < numWays; ++way) {
-        auto &entry = toUpdate[way];
-        if (!entry.valid) continue; // skip invalid entries
-        if (entry.position != alignedPosition) continue; // skip different position
-        if (entry.tag != monitorTag) continue; // skip different tag
-
-        foundWay = way;
-        stats.updateHitTimes++;
-        break;
-    }
-
-    // find entry already hit in victim cache
-    unsigned foundVictimWay = numVictimCacheSets;
-    for (unsigned way = 0; way < numVictimCacheSets; ++way) {
-        auto &entry = victimCache[alignedBankIdx][way];
-        Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
-
-        if (!entry.valid) continue; // skip invalid entries
-        if (entry.position != alignedPosition) continue; // skip different position
-        if (entry.tag != victimTag) continue; // skip different tag
-
-        foundVictimWay = way;
-        stats.updateHitVictimTimes++;
-        break;
-    }
-
-    // build new entry
-    TargetCarry shortCarry = computeCarryBits(
-        exec.pc,
-        exec.target,
-        maxOffsetBits
-    );
-    bool isCrossPage = shortCarry.isNone();
-
-    MonitorEntry newEntry;
-    newEntry.valid = true;
-    newEntry.isCrossPage = isCrossPage;
-    newEntry.alwaysTaken = true;
-    newEntry.isRVC = isRVC;
-    newEntry.position = alignedPosition;
-    newEntry.tag = monitorTag;
-    newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
-    newEntry.attr = execAttr;
-    newEntry.targetCarry = shortCarry;
-    newEntry.rrpv = insertRRPV;
-    newEntry.pageTableSet = pageTableIdx;
-
-    // compute long/short metadata
-    if (isCrossPage) {
-        stats.updateUsePagePointerTimes++;
-        newEntry.targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
-
-        Addr regionTableTag = getRegionTableTag(exec.target);
-
-        constexpr unsigned regionSet = 0;
-        unsigned regionTableWay = numRegionWays;
-        bool regionHit = false;
-        for (unsigned way = 0; way < numRegionWays; ++way) {
-            auto &regionEntry = regionTable[regionSet][way];
-            if (!regionEntry.valid) continue;
-            if (regionEntry.tag != regionTableTag) continue;
-
-            regionTableWay = way;
-            regionHit = true;
+        unsigned foundWay = numWays;
+        for (unsigned way = 0; way < numWays; ++way) {
+            auto &entry = toUpdate[way];
+            if (!entry.valid) continue;
+            if (entry.position != alignedPosition) continue;
+            if (entry.tag != monitorTag) continue;
+            foundWay = way;
+            stats.updateHitTimes++;
             break;
         }
 
-        if (regionTableWay == numRegionWays) {
-            regionTableWay = findOrSelectSRRIPWay(regionTable[regionSet]);
-        }
+        unsigned foundVictimWay = numVictimCacheSets;
+        for (unsigned way = 0; way < numVictimCacheSets; ++way) {
+            auto &entry = victimCache[alignedBankIdx][way];
+            Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
 
-        auto &regionEntry = regionTable[regionSet][regionTableWay];
-        regionEntry.valid = true;
-        regionEntry.tag = regionTableTag;
-        regionEntry.rrpv = regionHit ? srripTouch() : insertRRPV;
+            if (!entry.valid) continue;
+            if (entry.position != alignedPosition) continue;
+            if (entry.tag != victimTag) continue;
 
-        // check if page entry exists
-        unsigned pageTableWay = numPageWays;
-        bool pageHit = false;
-        for (unsigned way = 0; way < numPageWays; ++way) {
-            auto &pageEntry = pageTable[pageTableIdx][way];
-            if (!pageEntry.valid) continue;
-            Addr entryTag = pageEntry.tag;
-            if (entryTag != pageTableTag) continue;
-
-            pageTableWay = way;
-            pageHit = true;
+            foundVictimWay = way;
+            stats.updateHitVictimTimes++;
             break;
         }
-        // page entry not exists
-        if (pageTableWay == numPageWays) {
-            stats.updateAllocatePagePointerTimes++;
+        if (foundWay != numWays && foundVictimWay != numVictimCacheSets) {
+            stats.updateMultiHitTimes++;
+        }
 
-            pageTableWay = findOrSelectSRRIPWay(pageTable[pageTableIdx]);
+        TargetCarry shortCarry = computeCarryBits(exec.pc, exec.target, maxOffsetBits);
+        bool isCrossPage = shortCarry.isNone();
 
-            // update page entry
+        MonitorEntry newEntry;
+        newEntry.valid = true;
+        newEntry.isCrossPage = isCrossPage;
+        newEntry.alwaysTaken = true;
+        newEntry.isRVC = isRVC;
+        newEntry.position = alignedPosition;
+        newEntry.tag = monitorTag;
+        newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
+        newEntry.attr = execAttr;
+        newEntry.targetCarry = shortCarry;
+        newEntry.rrpv = insertRRPV;
+        newEntry.pageTableSet = pageTableIdx;
+
+        if (isCrossPage) {
+            stats.updateUsePagePointerTimes++;
+            newEntry.targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
+
+            Addr regionTableTag = getRegionTableTag(exec.target);
+
+            constexpr unsigned regionSet = 0;
+            unsigned regionTableWay = numRegionWays;
+            bool regionHit = false;
+            for (unsigned way = 0; way < numRegionWays; ++way) {
+                auto &regionEntry = regionTable[regionSet][way];
+                if (!regionEntry.valid) continue;
+                if (regionEntry.tag != regionTableTag) continue;
+
+                regionTableWay = way;
+                regionHit = true;
+                break;
+            }
+
+            if (regionTableWay == numRegionWays) {
+                regionTableWay = findOrSelectSRRIPWay(regionTable[regionSet]);
+            }
+
+            auto &regionEntry = regionTable[regionSet][regionTableWay];
+            regionEntry.valid = true;
+            regionEntry.tag = regionTableTag;
+            regionEntry.rrpv = regionHit ? srripTouch() : insertRRPV;
+
+            unsigned pageTableWay = numPageWays;
+            bool pageHit = false;
+            for (unsigned way = 0; way < numPageWays; ++way) {
+                auto &pageEntry = pageTable[pageTableIdx][way];
+                if (!pageEntry.valid) continue;
+                Addr entryTag = pageEntry.tag;
+                if (entryTag != pageTableTag) continue;
+
+                pageTableWay = way;
+                pageHit = true;
+                break;
+            }
+            if (pageTableWay == numPageWays) {
+                stats.updateAllocatePagePointerTimes++;
+
+                pageTableWay = findOrSelectSRRIPWay(pageTable[pageTableIdx]);
+
+                auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
+                pageEntry.valid = true;
+                pageEntry.tag = getPageTableTag(exec.target);
+
+                DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
+                    pageTableIdx, pageTableWay);
+                DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
+                printPageEntry(pageEntry);
+            }
+
             auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
             pageEntry.valid = true;
             pageEntry.tag = getPageTableTag(exec.target);
+            pageEntry.regionWay = regionTableWay;
+            pageEntry.rrpv = pageHit ? srripTouch() : insertRRPV;
 
-            DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
-                pageTableIdx, pageTableWay);
-            DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
-            printPageEntry(pageEntry);
+            newEntry.pageTableWay = pageTableWay;
+        } else {
+            newEntry.ctr = 0;
         }
 
-        auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
-        pageEntry.valid = true;
-        pageEntry.tag = getPageTableTag(exec.target);
-        pageEntry.regionWay = regionTableWay;
-        pageEntry.rrpv = pageHit ? srripTouch() : insertRRPV;
+        if (!isCrossPage &&
+            execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
+            if (foundWay != numWays) {
+                newEntry.ctr = toUpdate[foundWay].ctr;
+                newEntry.alwaysTaken = toUpdate[foundWay].alwaysTaken;
+            } else if (foundVictimWay != numVictimCacheSets) {
+                newEntry.ctr = victimCache[alignedBankIdx][foundVictimWay].ctr;
+                newEntry.alwaysTaken =
+                    victimCache[alignedBankIdx][foundVictimWay].alwaysTaken;
+            }
 
-        newEntry.pageTableWay = pageTableWay;
-    }
-    else {
-        // Initialize counter for non-crossPage conditional branches
-        newEntry.ctr = 0;
-    }
+            bool this_cond_taken =
+                stream.exeTaken && stream.getControlPC() == exec.pc;
+            if (!this_cond_taken) {
+                newEntry.alwaysTaken = false;
+            }
+            if (!newEntry.alwaysTaken) {
+                if (this_cond_taken && newEntry.ctr < 1) {
+                    newEntry.ctr++;
+                }
+                if (!this_cond_taken && newEntry.ctr > -2) {
+                    newEntry.ctr--;
+                }
+            }
+        }
 
-    // Update counter for conditional branches (only for non-crossPage entries)
-    if (!isCrossPage && execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
-        // Preserve existing ctr value from the found entry
+        stats.updateTotal++;
         if (foundWay != numWays) {
-            newEntry.ctr = toUpdate[foundWay].ctr;
-            newEntry.alwaysTaken = toUpdate[foundWay].alwaysTaken;
+            if (toUpdate[foundWay].targetOffset != newEntry.targetOffset) {
+                stats.updateFixTarget++;
+            }
+            toUpdate[foundWay] = newEntry;
+            toUpdate[foundWay].rrpv = srripTouch();
+            stats.updateExisting++;
+
+            DPRINTF(BTBPDede,
+                "BTBPDede: updated existing monitor entry at bank %d, index %d, way %d\n",
+                alignedBankIdx, monitorIdx, foundWay);
+
+            if (foundVictimWay != numVictimCacheSets) {
+                DPRINTF(BTBPDede,
+                    "BTBPDede: deduplicating victim cache entry at bank %d, way %d\n",
+                    alignedBankIdx, foundVictimWay);
+                victimCache[alignedBankIdx][foundVictimWay].valid = false;
+            }
         } else if (foundVictimWay != numVictimCacheSets) {
-            newEntry.ctr = victimCache[alignedBankIdx][foundVictimWay].ctr;
-            newEntry.alwaysTaken = victimCache[alignedBankIdx][foundVictimWay].alwaysTaken;
-        }
-
-        bool this_cond_taken = stream.exeTaken && stream.getControlPC() == exec.pc;
-        if (!this_cond_taken) {
-            newEntry.alwaysTaken = false;
-        }
-        if (!newEntry.alwaysTaken) {
-            // Update 2-bit saturating counter, range [-2, 1]
-            if (this_cond_taken && newEntry.ctr < 1) {
-                newEntry.ctr++;
+            auto &victimEntry = victimCache[alignedBankIdx][foundVictimWay];
+            if (victimEntry.targetOffset != newEntry.targetOffset) {
+                stats.updateFixTarget++;
             }
-            if (!this_cond_taken && newEntry.ctr > -2) {
-                newEntry.ctr--;
-            }
-        }
-    }
+            victimEntry = newEntry;
+            victimEntry.tag = getVictimCacheTag(monitorTag, monitorIdx);
+            victimEntry.rrpv = srripTouch();
+            stats.updateInVC++;
 
-    if (foundWay != numWays) {
-        toUpdate[foundWay] = newEntry;
-        toUpdate[foundWay].rrpv = srripTouch();
-
-        DPRINTF(BTBPDede, "BTBPDede: updated existing monitor entry at bank %d, index %d, way %d\n",
-            alignedBankIdx, monitorIdx, foundWay);
-
-        // deduplicate victim cache if foundVictimWay also hits
-        if (foundVictimWay != numVictimCacheSets) {
-            DPRINTF(BTBPDede, "BTBPDede: deduplicating victim cache entry at bank %d, way %d\n",
+            DPRINTF(BTBPDede,
+                "BTBPDede: updated existing victim cache entry at bank %d, way %d\n",
                 alignedBankIdx, foundVictimWay);
-            victimCache[alignedBankIdx][foundVictimWay].valid = false;
-        }
-    }
-    else if (foundVictimWay != numVictimCacheSets) {
-        // in-place update existing victim cache entry
-        auto &victimEntry = victimCache[alignedBankIdx][foundVictimWay];
-        victimEntry = newEntry;
-        victimEntry.tag = getVictimCacheTag(monitorTag, monitorIdx);
-        victimEntry.rrpv = srripTouch();
-
-        DPRINTF(BTBPDede, "BTBPDede: updated existing victim cache entry at bank %d, way %d\n",
-            alignedBankIdx, foundVictimWay);
-    }
-    else {
-        // need to allocate new entry
-        // For conditional branches that are not taken, don't allocate new entry
-        // only update existing entries to train the counter
-        if (!stream.exeTaken && execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
-            DPRINTF(BTBPDede, "BTBPDede: skip allocation for not taken conditional branch\n");
-            return;
-        }
-
-        stats.updateMissTimes++;
-
-        unsigned evictWay = numWays;
-
-        // firstly try to find invalid entry
-        for (unsigned i = 0; i < numWays; ++i) {
-            auto &entry = toUpdate[i];
-            if (!entry.valid) {
-                evictWay = i;
-                DPRINTF(BTBPDede, "BTBPDede: found empty way %d for bank %d idx %#lx\n",
-                    evictWay, alignedBankIdx, monitorIdx);
-                break;
+        } else {
+            if (!stream.exeTaken &&
+                execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
+                DPRINTF(BTBPDede,
+                    "BTBPDede: skip allocation for not taken conditional branch\n");
+                continue;
             }
-        }
 
-        if (evictWay == numWays) {
-            stats.updateEvictTimes++;
-            evictWay = findOrSelectSRRIPWay(toUpdate);
+            stats.updateMissTimes++;
 
-            DPRINTF(BTBPDede, "BTBPDede: evicting way %d for bank %d idx %#lx\n",
-                evictWay, alignedBankIdx, monitorIdx);
-        }
-
-        const auto &toEvictEntry = toUpdate[evictWay];
-
-        // evict to victim cache
-        if (toEvictEntry.valid && victimCacheEntries != 0) {
-            // insert evicted entry into victim cache
-            unsigned victimWay = numVictimCacheSets;
-            for (unsigned way = 0; way < numVictimCacheSets; way++) {
-                auto &victimEntry = victimCache[alignedBankIdx][way];
-                // find invalid entry first
-                if (!victimEntry.valid) {
-                    victimWay = way;
-                    DPRINTF(BTBPDede, "BTBPDede: found empty victim cache way %d for bank %d\n",
-                        victimWay, alignedBankIdx);
+            unsigned evictWay = numWays;
+            for (unsigned i = 0; i < numWays; ++i) {
+                auto &entry = toUpdate[i];
+                if (!entry.valid) {
+                    evictWay = i;
+                    stats.updateFoundEmptyTimes++;
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: found empty way %d for bank %d idx %#lx\n",
+                        evictWay, alignedBankIdx, monitorIdx);
                     break;
                 }
-                if (victimEntry.tag != getVictimCacheTag(toEvictEntry.tag, monitorIdx)) continue;
-                if (victimEntry.position != toEvictEntry.position) continue;
-                // update existing entry in victim cache
-                victimWay = way;
-                break;
             }
 
-            if (victimWay == numVictimCacheSets) {
-                victimWay = findOrSelectSRRIPWay(victimCache[alignedBankIdx]);
-                DPRINTF(BTBPDede, "BTBPDede: evicting victim cache way %d for bank %d\n",
-                    victimWay, alignedBankIdx);
+            if (evictWay == numWays) {
+                stats.updateEvictTimes++;
+                evictWay = findOrSelectSRRIPWay(toUpdate);
+                stats.updateReplace++;
+
+                DPRINTF(BTBPDede, "BTBPDede: evicting way %d for bank %d idx %#lx\n",
+                    evictWay, alignedBankIdx, monitorIdx);
             }
 
-            auto &victimEntry = victimCache[alignedBankIdx][victimWay];
-            victimEntry = toEvictEntry;
-            victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
-            victimEntry.rrpv = insertRRPV;
+            const auto &toEvictEntry = toUpdate[evictWay];
+            if (toEvictEntry.valid && evictWay < numWays) {
+                stats.updateReplaceValidOne++;
+            }
+
+            if (toEvictEntry.valid && victimCacheEntries != 0) {
+                unsigned victimWay = numVictimCacheSets;
+                for (unsigned way = 0; way < numVictimCacheSets; way++) {
+                    auto &victimEntry = victimCache[alignedBankIdx][way];
+                    if (!victimEntry.valid) {
+                        victimWay = way;
+                        DPRINTF(BTBPDede,
+                            "BTBPDede: found empty victim cache way %d for bank %d\n",
+                            victimWay, alignedBankIdx);
+                        break;
+                    }
+                    if (victimEntry.tag !=
+                        getVictimCacheTag(toEvictEntry.tag, monitorIdx)) continue;
+                    if (victimEntry.position != toEvictEntry.position) continue;
+                    victimWay = way;
+                    break;
+                }
+
+                if (victimWay == numVictimCacheSets) {
+                    victimWay = findOrSelectSRRIPWay(victimCache[alignedBankIdx]);
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: evicting victim cache way %d for bank %d\n",
+                        victimWay, alignedBankIdx);
+                }
+
+                auto &victimEntry = victimCache[alignedBankIdx][victimWay];
+                victimEntry = toEvictEntry;
+                victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
+                victimEntry.rrpv = insertRRPV;
+            }
+
+            toUpdate[evictWay] = newEntry;
+            toUpdate[evictWay].rrpv = insertRRPV;
         }
-
-        toUpdate[evictWay] = newEntry;
-        toUpdate[evictWay].rrpv = insertRRPV;
     }
 }
 
@@ -880,7 +907,11 @@ void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)
         if (new_entry.isCond) {
             new_entry.alwaysTaken = true;
             new_entry.ctr = 0;
+            stats.newEntryWithCond++;
+        } else {
+            stats.newEntryWithUncond++;
         }
+        stats.newEntry++;
         entry_to_write = new_entry;
         entry_to_write.resolved = stream.exeBranchInfo.resolved;
         is_old_entry = false;
@@ -910,34 +941,34 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
         }
     }
 
-    bool condNotTaken = inst->isCondCtrl() && !inst->branching();
     bool hitBranchTaken = stream.exeTaken && stream.getControlPC() == pc;
 
     // unsigned targetDiffBits = getTargetDiffBits(pc, npc);
 
     stats.totalBranchHits += branchHit;
+    stats.allBranchHits += branchHit;
     stats.totalBranchMisses += !branchHit;
+    stats.allBranchMisses += !branchHit;
 
     if (branchHit) {
         if (hitBranchTaken) {
-            // stats.totalBranchHitTakens++;
+            stats.allBranchHitTakens++;
         } else {
-            // stats.totalBranchHitNotTakens++;
+            stats.allBranchHitNotTakens++;
         }
         if (inst->isCondCtrl()) {
             stats.condHits++;
-            // stats.condTargetDiffBits.sample(targetDiffBits);
             if (hitBranchTaken) {
-                // stats.condHitTakens++;
+                stats.condHitTakens++;
             } else {
-                // stats.condHitNotTakens++;
+                stats.condHitNotTakens++;
             }
 
             bool pred_taken = entry.ctr >= 0;
             if (pred_taken == hitBranchTaken) {
-                // stats.condPredCorrect++;
+                stats.condPredCorrect++;
             } else {
-                // stats.condPredWrong++;
+                stats.condPredWrong++;
             }
 
         }
@@ -1031,19 +1062,19 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
         }
     } else {
         if (hitBranchTaken) {
-            // stats.totalBranchMissTakens++;
+            stats.allBranchMissTakens++;
         } else {
-            // stats.totalBranchMissNotTakens++;
+            stats.allBranchMissNotTakens++;
         }
         if (inst->isCondCtrl()) {
             stats.condMisses++;
             if (hitBranchTaken) {
-                // stats.condMissTakens++;
-                // stats.condPredWrong++;
+                stats.condMissTakens++;
+                stats.condPredWrong++;
 
             } else {
-                // stats.condMissNotTakens++;
-                // stats.condPredCorrect++;
+                stats.condMissNotTakens++;
+                stats.condPredCorrect++;
             }
         }
         if (inst->isUncondCtrl()) {
@@ -1068,6 +1099,11 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
 
 BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     statistics::Group(parent, "BTBPDede"),
+    ADD_STAT(newEntry, statistics::units::Count::get(), "number of new btb entries generated"),
+    ADD_STAT(newEntryWithCond, statistics::units::Count::get(),
+        "number of new btb entries generated with conditional branch"),
+    ADD_STAT(newEntryWithUncond, statistics::units::Count::get(),
+        "number of new btb entries generated with unconditional branch"),
     ADD_STAT(predTimes, statistics::units::Count::get(), "Number of predictions made"),
     ADD_STAT(predMissTimes, statistics::units::Count::get(), "Number of prediction misses"),
     ADD_STAT(predHitTimes, statistics::units::Count::get(), "Number of prediction hits"),
@@ -1077,6 +1113,8 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(predHitVictimEntries, statistics::units::Count::get(),
         "Number of predicted entries from victim cache"),
     ADD_STAT(updateTimes, statistics::units::Count::get(), "Number of updates made"),
+    ADD_STAT(updateMiss, statistics::units::Count::get(), "misses encountered on update"),
+    ADD_STAT(updateHit, statistics::units::Count::get(), "hits encountered on update"),
     ADD_STAT(updateMissTimes, statistics::units::Count::get(), "Number of update misses"),
     ADD_STAT(updateFoundEmptyTimes, statistics::units::Count::get(),"Number of update where an empty entry was found"),
     ADD_STAT(updateEvictTimes, statistics::units::Count::get(),"Number of update where an entry was evicted"),
@@ -1084,6 +1122,14 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(updateHitVictimTimes, statistics::units::Count::get(),
         "Number of update hits from victim cache"),
     ADD_STAT(updateMultiHitTimes, statistics::units::Count::get(), "Number of update multi-hits"),
+    ADD_STAT(updateExisting, statistics::units::Count::get(), "existing entries updated"),
+    ADD_STAT(updateReplace, statistics::units::Count::get(), "entries replaced"),
+    ADD_STAT(updateReplaceValidOne, statistics::units::Count::get(),
+        "entries replaced with valid entry"),
+    ADD_STAT(updateInVC, statistics::units::Count::get(), "entries updated in victim cache"),
+    ADD_STAT(updateTotal, statistics::units::Count::get(), "total number of entries updated"),
+    ADD_STAT(updateFixTarget, statistics::units::Count::get(),
+        "the number of fix entries target when update"),
     ADD_STAT(updateUsePagePointerTimes, statistics::units::Count::get(),
         "Number of updates using page pointer"),
     ADD_STAT(updateAllocatePagePointerTimes, statistics::units::Count::get(),
@@ -1094,10 +1140,34 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
         "Number of updates not using page pointer and no page pointer"),
     ADD_STAT(carryOverflowTimes, statistics::units::Count::get(),
         "Number of times carry overflow occurred during updates"),
+    ADD_STAT(allBranchHits, statistics::units::Count::get(),
+        "all types of branches committed that was predicted hit"),
     ADD_STAT(totalBranchHits, statistics::units::Count::get(), "Total number of branch hits in BTB"),
+    ADD_STAT(allBranchHitTakens, statistics::units::Count::get(),
+        "all types of taken branches committed was that predicted hit"),
+    ADD_STAT(allBranchHitNotTakens, statistics::units::Count::get(),
+        "all types of not taken branches committed was that predicted hit"),
+    ADD_STAT(allBranchMisses, statistics::units::Count::get(),
+        "all types of branches committed that was predicted miss"),
     ADD_STAT(totalBranchMisses, statistics::units::Count::get(), "Total number of branch misses in BTB"),
+    ADD_STAT(allBranchMissTakens, statistics::units::Count::get(),
+        "all types of taken branches committed was that predicted miss"),
+    ADD_STAT(allBranchMissNotTakens, statistics::units::Count::get(),
+        "all types of not taken branches committed was that predicted miss"),
     ADD_STAT(condHits, statistics::units::Count::get(), "Number of conditional branch hits"),
+    ADD_STAT(condHitTakens, statistics::units::Count::get(),
+        "taken conditional branches committed was that predicted hit"),
+    ADD_STAT(condHitNotTakens, statistics::units::Count::get(),
+        "not taken conditional branches committed was that predicted hit"),
     ADD_STAT(condMisses, statistics::units::Count::get(), "Number of conditional branch misses"),
+    ADD_STAT(condMissTakens, statistics::units::Count::get(),
+        "taken conditional branches committed was that predicted miss"),
+    ADD_STAT(condMissNotTakens, statistics::units::Count::get(),
+        "not taken conditional branches committed was that predicted miss"),
+    ADD_STAT(condPredCorrect, statistics::units::Count::get(),
+        "conditional branches committed was that correctly predicted by btb"),
+    ADD_STAT(condPredWrong, statistics::units::Count::get(),
+        "conditional branches committed was that mispredicted by btb"),
     ADD_STAT(uncondHits, statistics::units::Count::get(), "Number of unconditional branch hits"),
     ADD_STAT(uncondMisses, statistics::units::Count::get(), "Number of unconditional branch misses"),
     ADD_STAT(indirectHits, statistics::units::Count::get(), "Number of indirect branch hits"),

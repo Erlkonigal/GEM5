@@ -174,6 +174,8 @@ private:
     Addr getVictimCacheTag(Addr monitorTag, Addr monitorIdx);
 
     std::vector<BTBEntry> processMonitorEntries(Addr pc, const std::vector<MonitorSet>& monitorSets);
+    std::vector<BTBEntry> prepareUpdateEntries(const FetchTarget &stream);
+    void checkPredictionHit(const FetchTarget &stream, const BTBPDedeMeta *meta);
     void fillStagePredictions(
         const std::vector<BTBEntry>& btbEntries,
         std::vector<FullBTBPrediction>& stagePreds
@@ -191,6 +193,10 @@ private:
     typedef statistics::Scalar Scalar;
     struct PDedeStats : public statistics::Group
     {
+        Scalar newEntry;
+        Scalar newEntryWithCond;
+        Scalar newEntryWithUncond;
+
         Scalar predTimes;
         Scalar predMissTimes;
         Scalar predHitTimes;
@@ -199,6 +205,8 @@ private:
         Scalar predHitVictimEntries;
 
         Scalar updateTimes;
+        Scalar updateMiss;
+        Scalar updateHit;
         Scalar updateMissTimes;
         Scalar updateFoundEmptyTimes;
         Scalar updateEvictTimes;
@@ -206,6 +214,12 @@ private:
         Scalar updateHitTimes;
         Scalar updateHitVictimTimes;
         Scalar updateMultiHitTimes;
+        Scalar updateExisting;
+        Scalar updateReplace;
+        Scalar updateReplaceValidOne;
+        Scalar updateInVC;
+        Scalar updateTotal;
+        Scalar updateFixTarget;
 
         Scalar updateUsePagePointerTimes;
         Scalar updateAllocatePagePointerTimes;
@@ -214,11 +228,23 @@ private:
 
         Scalar carryOverflowTimes;
 
+        Scalar allBranchHits;
         Scalar totalBranchHits;
+        Scalar allBranchHitTakens;
+        Scalar allBranchHitNotTakens;
+        Scalar allBranchMisses;
         Scalar totalBranchMisses;
+        Scalar allBranchMissTakens;
+        Scalar allBranchMissNotTakens;
 
         Scalar condHits;
+        Scalar condHitTakens;
+        Scalar condHitNotTakens;
         Scalar condMisses;
+        Scalar condMissTakens;
+        Scalar condMissNotTakens;
+        Scalar condPredCorrect;
+        Scalar condPredWrong;
 
         Scalar uncondHits;
         Scalar uncondMisses;
