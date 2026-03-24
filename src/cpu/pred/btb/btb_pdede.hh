@@ -44,82 +44,43 @@ private:
     unsigned numRegionSets;
     unsigned numVictimCacheSets;
 
-    // TODO: offset bits need profiling to decide
-    static constexpr unsigned maxOffsetBits = 11;
-    static constexpr uint8_t maxRRPV = 3;
-    static constexpr uint8_t insertRRPV = 2;
+    static constexpr unsigned pageSize = 4096;
 
-    struct BranchAttribute
+    static constexpr unsigned shortSlots = 2;
+    static constexpr unsigned shortSlotTargetBits = 7;
+    static constexpr unsigned longSlotTargetBits = 11;
+
+    static constexpr unsigned monitorMaxRrpv = 3;
+    static constexpr unsigned pageMaxRrpv = 3;
+    static constexpr unsigned regionMaxRrpv = 3;
+
+    struct MonitorShortSlot
     {
-        enum class BranchTypeEnum
-        {
-            None, Conditional, Direct, Indirect
-        } branchType;
-        enum class RasActionEnum
-        {
-            None, Pop, Push, PopAndPush
-        } rasAction;
+        bool valid = 0;
+        bool alwaysTaken;
+        BranchInfo bi;
+        int ctr;
     };
-    struct TargetCarry
-    {
-        enum class TargetCarryEnum
-        {
-            Fit, PlusOne, MinusOne, None
-        } targetCarry;
 
-        bool isFit() const {
-            return targetCarry == TargetCarryEnum::Fit;
-        }
-        bool isPlusOne() const {
-            return targetCarry == TargetCarryEnum::PlusOne;
-        }
-        bool isMinusOne() const {
-            return targetCarry == TargetCarryEnum::MinusOne;
-        }
-        bool isNone() const {
-            return targetCarry == TargetCarryEnum::None;
-        }
+    struct MonitorLongSlot
+    {
+        // use slot0's valid
+        // if both overflow and underflow are true, it means the target is cross page
+        bool isCrossPage;
+        bool isOverflow;
+        bool isUnderflow;
+        // pageBTB index and way
+        Addr index;
+        Addr way;
+        BranchInfo bi;
     };
 
     struct MonitorEntry
     {
-    private:
-        // const attributes
-        int offsetBits;
-        bool usePagePointer;
-    public:
-        bool valid;
-        bool isCrossPage;
-        bool alwaysTaken;
-        bool isRVC; // true: 2-byte compressed instruction, false: 4-byte standard instruction
-        unsigned position; // position of the last 2 bytes in the fetch block
+        bool fused = 0;
         Addr tag;
-        Addr targetOffset; // target low bits
-        BranchAttribute attr;
-        uint8_t rrpv;
-
-        Addr pageTableSet;
-        unsigned pageTableWay; // used as long target with page pointer
-        int8_t ctr;            // used as conditional short target prediction counter, range [-2, 1]
-        TargetCarry targetCarry;
-
-
-        MonitorEntry() : offsetBits(maxOffsetBits), usePagePointer(true), valid(false),
-            isCrossPage(false), alwaysTaken(true), isRVC(true), rrpv(maxRRPV),
-            pageTableSet(0), pageTableWay(0), ctr(0)
-        {
-            targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
-        }
-        MonitorEntry(int offsetBits, bool usePagePointer)
-            : offsetBits(offsetBits), usePagePointer(usePagePointer), valid(false),
-              isCrossPage(false), alwaysTaken(true), isRVC(true), rrpv(maxRRPV),
-              pageTableSet(0), pageTableWay(0), ctr(0)
-        {
-            targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
-        }
-
-        int getOffsetBits() const { return offsetBits; }
-        bool isUsePagePointer() const { return usePagePointer; }
+        MonitorShortSlot shortSlots[2];
+        MonitorLongSlot longSlot;
     };
     typedef std::vector<MonitorEntry> MonitorSet;
     typedef std::vector<MonitorSet> MonitorAlignBank;
@@ -127,18 +88,17 @@ private:
     struct PageEntry
     {
         bool valid;
-        Addr tag;
-        Addr regionWay;
-        uint8_t rrpv;
+        Addr vpnLower;
+        // regionBTB way
+        Addr way;
     };
-    typedef std::vector<PageEntry> PageSet;
 
     struct RegionEntry
     {
         bool valid;
-        Addr tag;
-        uint8_t rrpv;
+        Addr vpnUpper;
     };
+    typedef std::vector<PageEntry> PageSet;
     typedef std::vector<RegionEntry> RegionSet;
 
     struct BTBPDedeMeta
@@ -146,32 +106,39 @@ private:
         std::vector<MonitorSet> rawMonitorSets;
         std::vector<BTBEntry> btbEntries;
     };
-    // typedef std::vector<MonitorSet> BTBPDedeMeta;
 
     std::shared_ptr<BTBPDedeMeta> meta;
 
     // sram implementation
-    std::vector<MonitorAlignBank> monitorTable;
+    std::vector<MonitorAlignBank> monitorBTB;
+    std::vector<PageSet> pageBTB;
+    std::vector<RegionSet> regionBTB;
+    // std::vector<MonitorSet> victimCache;
 
-    std::vector<PageSet> pageTable;
+    typedef std::vector<unsigned> RrpvSet;
+    typedef std::vector<RrpvSet> RrpvBank;
 
-    std::vector<RegionSet> regionTable;
+    std::vector<RrpvBank> monitorRrpv;
+    std::vector<RrpvSet> pageRrpv;
+    std::vector<RrpvSet> regionRrpv;
 
-    std::vector<MonitorSet> victimCache;
+    unsigned getPhysicalAlignBankIdx(Addr pc, unsigned logicBankIdx);
+    Addr getShortSlotTarget(Addr pc, const MonitorShortSlot &slot, unsigned targetBits);
+    Addr getLongSlotTarget(Addr pc, const MonitorLongSlot &slot, unsigned targetBits);
 
-    unsigned getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx);
-    Addr getFullTarget(Addr pc, const MonitorEntry &entry);
-    TargetCarry computeCarryBits(Addr pc, Addr target, unsigned offsetBits);
+    bool isOverflow(Addr pc, Addr target, unsigned targetBits);
+    bool isUnderflow(Addr pc, Addr target, unsigned targetBits);
+    bool isCrossPage(Addr pc, Addr target);
 
-    Addr getMonitorIdx(Addr pc);
-    Addr getMonitorTag(Addr pc);
+    Addr getMonitorBTBIdx(Addr pc);
+    Addr getMonitorBTBTag(Addr pc);
     std::vector<MonitorSet> getMonitorEntries(Addr pc);
 
-    Addr getPageTableIdx(Addr target);
-    Addr getPageTableTag(Addr target);
-    Addr getRegionTableTag(Addr target);
+    Addr getPageBTBIdx(Addr target, unsigned targetBits);
+    Addr getVpnLower(Addr target, unsigned targetBits);
+    Addr getVpnUpper(Addr target, unsigned targetBits);
 
-    Addr getVictimCacheTag(Addr monitorTag, Addr monitorIdx);
+    // Addr getVictimCacheTag(Addr monitorTag, Addr monitorIdx);
 
     std::vector<BTBEntry> processMonitorEntries(Addr pc, const std::vector<MonitorSet>& monitorSets);
     std::vector<BTBEntry> prepareUpdateEntries(const FetchTarget &stream);
@@ -181,14 +148,14 @@ private:
         std::vector<FullBTBPrediction>& stagePreds
     );
 
-    // unsigned getTargetDiffBits(Addr pc, Addr target);
-    // unsigned getPartitionIdx(const BranchInfo &exec, const MonitorSet &meta);
+    void updateResolvedEntry(const BTBEntry &entry, const FetchTarget &stream);
 
     void printBTBEntry(const BTBEntry& e);
     void dumpBTBEntries(const std::vector<BTBEntry>& es);
 
     void printMonitorEntry(const MonitorEntry& e);
     void printPageEntry(const PageEntry& e);
+    void printRegionEntry(const RegionEntry& e);
 
     typedef statistics::Scalar Scalar;
     struct PDedeStats : public statistics::Group

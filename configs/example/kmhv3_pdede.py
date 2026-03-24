@@ -101,15 +101,17 @@ def setKmhV3Params(args, system):
                     usePathHashHistory=True)
 
             cpu.branchPred.pdede.resolvedUpdate = True
+
             cpu.branchPred.mbtb.resolvedUpdate = True
             cpu.branchPred.tage.resolvedUpdate = True
             cpu.branchPred.ittage.resolvedUpdate = True
 
+            cpu.branchPred.pdede.enabled = True
+            cpu.branchPred.mbtb.enabled = False
+
             cpu.branchPred.ubtb.enabled = True
             cpu.branchPred.abtb.enabled = True
             cpu.branchPred.microtage.enabled = True
-            cpu.branchPred.pdede.enabled = True
-            cpu.branchPred.mbtb.enabled = False
             cpu.branchPred.tage.enabled = True
             cpu.branchPred.ittage.enabled = True
             cpu.branchPred.mgsc.enabled = True

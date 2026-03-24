@@ -7,46 +7,6 @@ namespace gem5 {
 namespace branch_prediction {
 namespace btb_pred {
 
-namespace {
-
-constexpr uint8_t kMaxRRPV = 3;
-
-uint8_t
-srripTouch()
-{
-    return 0;
-}
-
-template <class SetType>
-unsigned
-findOrSelectSRRIPWay(SetType &set)
-{
-    if (set.empty()) {
-        return 0;
-    }
-
-    for (unsigned way = 0; way < set.size(); ++way) {
-        if (!set[way].valid) {
-            return way;
-        }
-    }
-
-    while (true) {
-        for (unsigned way = 0; way < set.size(); ++way) {
-            if (set[way].rrpv == kMaxRRPV) {
-                return way;
-            }
-        }
-        for (auto &entry : set) {
-            if (entry.rrpv < kMaxRRPV) {
-                entry.rrpv++;
-            }
-        }
-    }
-}
-
-} // anonymous namespace
-
 BTBPDede::BTBPDede(const Params& p):
     TimedBaseBTBPredictor(p),
     instShiftAmt(p.instShiftAmt),
@@ -62,74 +22,51 @@ BTBPDede::BTBPDede(const Params& p):
     victimCacheEntries(p.victimCacheEntries),
     stats(this)
 {
-    /*
-        Totally 8192 entries
-        Monitor table: 2 Align Banks
-
-            each bank has 4096 entries
-            each entry has numWay ways, 4096/numWay entries per way
-            for way 0 to way numWay-1, offset bits are 11, with PagePointer
-
-        Page table:
-            2 align banks use the same page table, totally 512 entries
-            each entry has 16 ways, 32 entries per way
-            each entry in a way has pageBits bits of tag
-            we use targetOffset bits [11:7] to index the page table
-            if cross-page, we use Cat(pcHigher, pageTag, targetOffset, 0.B(instShiftAmt)) to form the full target
-            otherwise, we use Cat(pcHigher, pagePointerWay, targetOffset, 0.B(instShiftAmt)) to form the full target
-
-        We choose Solution 1 when numWays == 4, Solution 2 when numWays == 8
-    */
-
     numAlignBanks = predictWidth / blockSize; // 2 align banks
 
-    // Initialize monitor table
+    // Initialize monitor btb
     numSets = numEntries / (numWays * numAlignBanks);
-    monitorTable.resize(numAlignBanks);
+    monitorBTB.resize(numAlignBanks);
+    monitorRrpv.resize(numAlignBanks);
     for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
-        monitorTable[bank].resize(numSets);
+        monitorBTB[bank].resize(numSets);
+        monitorRrpv[bank].resize(numSets);
         for (unsigned set = 0; set < numSets; ++set) {
-            monitorTable[bank][set].reserve(numWays);
-            for (unsigned way = 0; way < numWays; ++way) {
-                monitorTable[bank][set].emplace_back();
-            }
+            monitorBTB[bank][set].resize(numWays);
+            monitorRrpv[bank][set].resize(numWays * shortSlots);
+            std::for_each(monitorRrpv[bank][set].begin(), monitorRrpv[bank][set].end(),
+                [](unsigned &rrpv) { rrpv = monitorMaxRrpv; });
         }
     }
-    // Initialize page table
+    // Initialize page btb
     numPageSets = numPageEntries / numPageWays;
-    pageTable.resize(numPageSets);
+    pageBTB.resize(numPageSets);
+    pageRrpv.resize(numPageSets);
     for (unsigned set = 0; set < numPageSets; ++set) {
-        pageTable[set].resize(numPageWays);
-        for (unsigned way = 0; way < numPageWays; ++way) {
-            pageTable[set][way].valid = false;
-            pageTable[set][way].tag = 0;
-            pageTable[set][way].regionWay = 0;
-            pageTable[set][way].rrpv = maxRRPV;
-        }
+        pageBTB[set].resize(numPageWays);
+        pageRrpv[set].resize(numPageWays);
+        std::for_each(pageRrpv[set].begin(), pageRrpv[set].end(),
+            [](unsigned &rrpv) { rrpv = pageMaxRrpv; });
     }
 
-    // Initialize region table
+    // Initialize region btb
     numRegionSets = numRegionEntries / numRegionWays;
     assert(numRegionSets == 1);
-    regionTable.resize(numRegionSets);
+    regionBTB.resize(numRegionSets);
+    regionRrpv.resize(numRegionSets);
     for (unsigned set = 0; set < numRegionSets; ++set) {
-        regionTable[set].resize(numRegionWays);
-        for (unsigned way = 0; way < numRegionWays; ++way) {
-            regionTable[set][way].valid = false;
-            regionTable[set][way].tag = 0;
-            regionTable[set][way].rrpv = maxRRPV;
-        }
+        regionBTB[set].resize(numRegionWays);
+        regionRrpv[set].resize(numRegionWays);
+        std::for_each(regionRrpv[set].begin(), regionRrpv[set].end(),
+            [](unsigned &rrpv) { rrpv = regionMaxRrpv; });
     }
 
     // Initialize victim cache
-    numVictimCacheSets = victimCacheEntries / numAlignBanks;
-    victimCache.resize(numAlignBanks);
-    for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
-        victimCache[bank].reserve(numVictimCacheSets);
-        for (unsigned set = 0; set < numVictimCacheSets; ++set) {
-            victimCache[bank].emplace_back(20, false);
-        }
-    }
+    // numVictimCacheSets = victimCacheEntries / numAlignBanks;
+    // victimCache.resize(numAlignBanks);
+    // for (unsigned bank = 0; bank < numAlignBanks; ++bank) {
+    //     victimCache[bank].resize(numVictimCacheSets);
+    // }
 
 
     DPRINTF(BTBPDede, "BTBPDede initialized: numEntries %d, numWays %d, numSets %d, "
@@ -151,7 +88,7 @@ std::shared_ptr<void> BTBPDede::getPredictionMeta()
     return meta;
 }
 
-unsigned BTBPDede::getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx)
+unsigned BTBPDede::getPhysicalAlignBankIdx(Addr pc, unsigned logicBankIdx)
 {
     // Rotate align bank index based on PC bits to reduce conflicts
     unsigned alignBankWidth = floorLog2(blockSize);
@@ -159,94 +96,63 @@ unsigned BTBPDede::getRotatedAlignBankIdx(Addr pc, unsigned logicBankIdx)
     return (logicBankIdx + rotation) % numAlignBanks;
 }
 
-Addr BTBPDede::getFullTarget(Addr pc, const MonitorEntry &entry)
+Addr BTBPDede::getShortSlotTarget(Addr pc, const MonitorShortSlot &slot, unsigned targetBits)
 {
-    Addr targetLower = entry.targetOffset << instShiftAmt;
-
-    Addr fullTarget = 0;
-    TargetCarry carry = entry.targetCarry;
-
-    Addr pcMiddle = pc & ~mask(entry.getOffsetBits() + instShiftAmt);
-    Addr pcMiddlePlusOne = pcMiddle + (1ULL << (entry.getOffsetBits() + instShiftAmt));
-    Addr pcMiddleMinusOne = pcMiddle - (1ULL << (entry.getOffsetBits() + instShiftAmt));
-
-    // For long targets, reconstruct with regionTag + pageTag + targetLower.
-    if (entry.isUsePagePointer() && entry.isCrossPage) {
-        if (entry.pageTableSet >= numPageSets || entry.pageTableWay >= numPageWays) {
-            return targetLower;
-        }
-        const auto &pageEntry = pageTable[entry.pageTableSet][entry.pageTableWay];
-        if (!pageEntry.valid || pageEntry.regionWay >= numRegionWays) {
-            return targetLower;
-        }
-        constexpr unsigned regionSet = 0;
-        const auto &regionEntry = regionTable[regionSet][pageEntry.regionWay];
-        if (!regionEntry.valid) {
-            return targetLower;
-        }
-
-        Addr pageSection = pageEntry.tag << (maxOffsetBits + instShiftAmt);
-        Addr regionSection =
-            regionEntry.tag << (pageBits + maxOffsetBits + instShiftAmt);
-        fullTarget = regionSection | pageSection | targetLower;
-    }
-    else {
-        // Non-crossPage entries: use carry bits with pcMiddle
-        if (carry.isFit()) {
-            fullTarget = pcMiddle | targetLower;
-        }
-        else if (carry.isPlusOne()) {
-            fullTarget = pcMiddlePlusOne | targetLower;
-        }
-        else if (carry.isMinusOne()){
-            fullTarget = pcMiddleMinusOne | targetLower;
-        }
-        else {
-            fullTarget = targetLower; // invalid target
-        }
-    }
-
-    return fullTarget;
+    Addr validTargetBits = targetBits + instShiftAmt;
+    Addr validTargetMask = mask(validTargetBits);
+    Addr targetLower = slot.bi.target & validTargetMask;
+    Addr pcUpper = pc & ~validTargetMask;
+    return pcUpper | targetLower;
 }
 
-BTBPDede::TargetCarry BTBPDede::computeCarryBits(Addr pc, Addr target, unsigned offsetBits)
+Addr BTBPDede::getLongSlotTarget(Addr pc, const MonitorLongSlot &slot, unsigned targetBits)
 {
-    TargetCarry carry;
-    Addr pcUpper = pc & ~mask(offsetBits + instShiftAmt);
-    Addr pcUpperPlusOne = pcUpper + (1ULL << (offsetBits + instShiftAmt));
-    Addr pcUpperMinusOne = pcUpper - (1ULL << (offsetBits + instShiftAmt));
+    Addr validTargetBits = targetBits + instShiftAmt;
+    Addr validTargetMask = mask(validTargetBits);
+    Addr targetLower = slot.bi.target & validTargetMask;
+    Addr pcUpper = pc & ~validTargetMask;
+    Addr pcUpperOverflow = pcUpper + (1ULL << validTargetBits);
+    Addr pcUpperUnderflow = pcUpper - (1ULL << validTargetBits);
+    if (!slot.isCrossPage) {
+        if (slot.isOverflow) {
+            return pcUpperOverflow | targetLower;
+        } else if (slot.isUnderflow) {
+            return pcUpperUnderflow | targetLower;
+        } else {
+            return pcUpper | targetLower;
+        }
+    } else {
+        // access Page/Region-BTB to get the full target
+        if (slot.index >= numPageSets || slot.way >= numPageWays) {
+            DPRINTF(BTBPDede,
+                "BTBPDede: invalid page pointer idx=%#lx way=%#lx, fallback to non-cross-page decode\n",
+                slot.index, slot.way);
+            return pcUpper | targetLower;
+        }
 
-    Addr targetLower = target & mask(offsetBits + instShiftAmt);
+        const auto &pageBTBEntry = pageBTB[slot.index][slot.way];
+        if (!pageBTBEntry.valid || pageBTBEntry.way >= numRegionWays ||
+            !regionBTB[0][pageBTBEntry.way].valid) {
+            DPRINTF(BTBPDede,
+                "BTBPDede: stale page/region pointer idx=%#lx way=%#lx rway=%#lx, fallback to non-cross-page decode\n",
+                slot.index, slot.way, pageBTBEntry.way);
+            return pcUpper | targetLower;
+        }
 
-    Addr candidateFit = pcUpper | targetLower;
-    Addr candidatePlusOne = pcUpperPlusOne | targetLower;
-    Addr candidateMinusOne = pcUpperMinusOne | targetLower;
-
-    if (candidateFit == target) {
-        carry.targetCarry = TargetCarry::TargetCarryEnum::Fit;
+        Addr vpnLower = pageBTBEntry.vpnLower << (validTargetBits);
+        Addr vpnUpper = regionBTB[0][pageBTBEntry.way].vpnUpper << (pageBits + validTargetBits);
+        return vpnUpper | vpnLower | targetLower;
     }
-    else if (candidatePlusOne == target) {
-        carry.targetCarry = TargetCarry::TargetCarryEnum::PlusOne;
-    }
-    else if (candidateMinusOne == target) {
-        carry.targetCarry = TargetCarry::TargetCarryEnum::MinusOne;
-    }
-    else {
-        carry.targetCarry = TargetCarry::TargetCarryEnum::None;
-    }
-
-    stats.carryOverflowTimes += carry.isNone();
-    return carry;
 }
 
-Addr BTBPDede::getMonitorIdx(Addr pc)
+Addr BTBPDede::getMonitorBTBIdx(Addr pc)
 {
     unsigned fetchBlockWidth = floorLog2(predictWidth);
     Addr idx = (pc >> fetchBlockWidth) & (numSets - 1);
     return idx;
 }
 
-Addr BTBPDede::getMonitorTag(Addr pc)
+Addr BTBPDede::getMonitorBTBTag(Addr pc)
 {
     unsigned fetchBlockWidth = floorLog2(predictWidth);
     unsigned setWidth = floorLog2(numSets);
@@ -280,32 +186,21 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
     Addr alignedStartAddr = pc & ~(blockSize - 1);
 
     for (unsigned i = 0; i < numAlignBanks; ++i) {
-        unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
+        unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
         Addr alignedAddr = alignedStartAddr + blockSize * i;
-        Addr idx = getMonitorIdx(alignedAddr);
-        MonitorSet monitorSet = monitorTable[phyBankIdx][idx];
+        Addr idx = getMonitorBTBIdx(alignedAddr);
+        MonitorSet monitorSet = monitorBTB[phyBankIdx][idx];
         res[phyBankIdx] = monitorSet;
     }
 
     return res;
 }
 
-Addr BTBPDede::getPageTableIdx(Addr target) {
-    // Solution 1
-    // select high floorLog2(numPageSets) bits from targetOffset
-    // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
-    // then we select bits [11:11-5+1] = bits [11:7] from targetOffset
-    // unsigned setWidth = floorLog2(numPageSets);
-    // Addr idx = (target >> (maxOffsetBits - setWidth + instShiftAmt)) & (numPageSets - 1);
-
-    // Solution 2
-    // select low floorLog2(numPageSets) bits from targetOffset
-    // example: floorLog2(numPageSets) = 5, maxOffsetBits = 11, instShiftAmt = 1
-    // then we select bits [5:1] from targetOffset
-    // Addr idx = (target >> instShiftAmt) & (numPageSets - 1);
-
+Addr BTBPDede::getPageBTBIdx(Addr target, unsigned targetBits)
+{
     unsigned setWidth = floorLog2(numPageSets);
-    Addr idxFull = (target >> (instShiftAmt + maxOffsetBits));
+    unsigned validTargetBits = targetBits + instShiftAmt;
+    Addr idxFull = target >> validTargetBits;
 
     // use idxFull[setWidth * 2 - 1:setWidth] ^ idxFull[setWidth - 1:0] to reduce conflicts
     Addr idxHigher = (idxFull >> setWidth) & mask(setWidth);
@@ -315,21 +210,23 @@ Addr BTBPDede::getPageTableIdx(Addr target) {
     return idx;
 }
 
-Addr BTBPDede::getPageTableTag(Addr target) {
-    Addr fullTag = target >> (maxOffsetBits + instShiftAmt);
+Addr BTBPDede::getVpnLower(Addr target, unsigned targetBits) {
+    unsigned validTargetBits = targetBits + instShiftAmt;
+    Addr fullTag = target >> validTargetBits;
     return fullTag & mask(pageBits);
 }
 
-Addr BTBPDede::getRegionTableTag(Addr target) {
-    return target >> (pageBits + maxOffsetBits + instShiftAmt);
+Addr BTBPDede::getVpnUpper(Addr target, unsigned targetBits) {
+    unsigned validTargetBits = targetBits + instShiftAmt;
+    return target >> (pageBits + validTargetBits);
 }
 
-Addr BTBPDede::getVictimCacheTag(Addr monitorTag, Addr monitorIdx)
-{
-    unsigned monitorSetWidth = floorLog2(numSets);
-    Addr victimTag = (monitorTag << monitorSetWidth) | monitorIdx;
-    return victimTag;
-}
+// Addr BTBPDede::getVictimCacheTag(Addr monitorTag, Addr monitorIdx)
+// {
+//     unsigned monitorSetWidth = floorLog2(numSets);
+//     Addr victimTag = (monitorTag << monitorSetWidth) | monitorIdx;
+//     return victimTag;
+// }
 
 std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector<MonitorSet> &originEntries)
 {
@@ -338,114 +235,115 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
 
     // collect all valid entries
     for (unsigned i = 0; i < numAlignBanks; ++i) {
-        unsigned phyBankIdx = getRotatedAlignBankIdx(pc, i);
+        unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
         auto &bank = monitorEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
-        bool foundInVictimCache = false;
 
-        for (unsigned way = 0; way < numWays + numVictimCacheSets; ++way) {
-            MonitorEntry &entry =
-                (way < numWays) ? bank[way] : victimCache[phyBankIdx][way - numWays];
+        for (unsigned way = 0; way < numWays; ++way) {
+            MonitorEntry &entry = bank[way];
 
-            Addr branchPC;
-            if (entry.isRVC) {
-                branchPC = alignedAddr + (entry.position << 1);
+            Addr monitorBTBIdx = getMonitorBTBIdx(alignedAddr);
+            Addr monitorBTBTag = getMonitorBTBTag(alignedAddr);
+
+            auto checkValidEntry = [&](bool valid, Addr tag, Addr branchPc) -> bool {
+                if (!valid) return false;
+                if (branchPc < pc || branchPc >= (pc + predictWidth)) return false;
+                if (tag != monitorBTBTag) return false;
+                return true;
+            };
+
+            bool hitLongSlot = false;
+            bool hitShortSlot[shortSlots] = {false};
+
+            if (!entry.fused) {
+                for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                    auto shortSlot = entry.shortSlots[slot];
+                    if (!checkValidEntry(shortSlot.valid, entry.tag, shortSlot.bi.pc)) continue;
+                    hitShortSlot[slot] = true;
+                    Addr alignedBranchPc = shortSlot.bi.pc & ~(blockSize - 1);
+                    assert(alignedBranchPc == alignedAddr);
+
+                    BTBEntry btbEntry;
+                    btbEntry.valid = true;
+                    btbEntry.pc = shortSlot.bi.pc;
+                    btbEntry.tag = entry.tag;
+                    btbEntry.target = getShortSlotTarget(shortSlot.bi.pc, shortSlot, shortSlotTargetBits);
+                    btbEntry.isCond = shortSlot.bi.isCond;
+                    btbEntry.isDirect = shortSlot.bi.isDirect;
+                    btbEntry.isIndirect = shortSlot.bi.isIndirect;
+                    btbEntry.isCall = shortSlot.bi.isCall;
+                    btbEntry.isReturn = shortSlot.bi.isReturn;
+                    btbEntry.size = shortSlot.bi.size;
+                    btbEntry.alwaysTaken = shortSlot.alwaysTaken;
+                    btbEntry.ctr = shortSlot.ctr;
+                    btbEntries.push_back(btbEntry);
+                    DPRINTF(BTBPDede, "BTBPDede: use short slot %d way %d for bank %d alignedAddr %#lx\n",
+                        slot,
+                        way,
+                        phyBankIdx,
+                        alignedAddr
+                    );
+                }
             } else {
-                branchPC = alignedAddr + (entry.position << 1) - 2;
-            }
-            Addr monitorIdx = getMonitorIdx(alignedAddr);
-            Addr monitorTag = getMonitorTag(alignedAddr);
-            Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
+                auto longSlot = entry.longSlot;
+                // long slot use short slot0's valid bit to indicate valid
+                if (!checkValidEntry(entry.shortSlots[0].valid, entry.tag, longSlot.bi.pc)) continue;
+                hitLongSlot = true;
+                Addr alignedBranchPc = longSlot.bi.pc & ~(blockSize - 1);
+                assert(alignedBranchPc == alignedAddr);
 
-            if (!entry.valid) continue;
-            if (branchPC < pc || branchPC >= (pc + predictWidth)) continue;
-            if (entry.tag != (way < numWays ? monitorTag : victimTag)) continue;
-
-            DPRINTF(BTBPDede, "BTBPDede: use entry from %s way %d for bank %d alignedAddr %#lx\n",
-                (way < numWays) ? "monitor" : "victim cache",
-                (way < numWays) ? way : (way - numWays),
-                phyBankIdx,
-                alignedAddr);
-
-            if (way >= numWays) {
-                foundInVictimCache = true;
-                stats.predHitVictimEntries++;
-            }
-
-            BTBEntry btbEntry;
-            btbEntry.valid = true;
-            btbEntry.pc = branchPC;
-            btbEntry.tag = entry.tag;
-            btbEntry.target = getFullTarget(branchPC, entry);
-            btbEntry.isCond = (entry.attr.branchType == BranchAttribute::BranchTypeEnum::Conditional);
-            btbEntry.isIndirect = (entry.attr.branchType == BranchAttribute::BranchTypeEnum::Indirect);
-            btbEntry.isCall = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Push);
-            btbEntry.isReturn = (entry.attr.rasAction == BranchAttribute::RasActionEnum::Pop);
-            btbEntry.size = entry.isRVC ? 2 : 4;
-            // Set counter for conditional branches (only valid for non-crossPage entries)
-            if (btbEntry.isCond && entry.isCrossPage) {
-                printf("BTBPDede: found conditional branch entry with cross-page target"
-                                ", which is not supported. pc %#lx\n",
-                    btbEntry.pc);
-                printf("BTBPDede: entry details - isCond %d, isIndirect %d, isCall %d, isReturn %d, isCrossPage %d\n",
-                    btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn, entry.isCrossPage);
-                assert(!(btbEntry.isCond && entry.isCrossPage));
-            }
-            if (btbEntry.isCond && !entry.isCrossPage) {
-                btbEntry.alwaysTaken = entry.alwaysTaken;
-                btbEntry.ctr = entry.ctr;
-            }
-            btbEntries.push_back(btbEntry);
-            DPRINTF(BTBPDede, "BTBPDede: found valid BTB entry pc %#lx target %#lx\n",
-                btbEntry.pc, btbEntry.target);
-            DPRINTF(BTBPDede, "BTBPDede: entry details - isCond %d, isIndirect %d, isCall %d, isReturn %d\n",
-                btbEntry.isCond, btbEntry.isIndirect, btbEntry.isCall, btbEntry.isReturn);
-
-            if (way >= numWays) {
-                victimCache[phyBankIdx][way - numWays].rrpv = srripTouch();
-                continue;
+                BTBEntry btbEntry;
+                btbEntry.valid = true;
+                btbEntry.pc = longSlot.bi.pc;
+                btbEntry.tag = entry.tag;
+                btbEntry.target = getLongSlotTarget(longSlot.bi.pc, longSlot, longSlotTargetBits);
+                btbEntry.isCond = longSlot.bi.isCond;
+                btbEntry.isDirect = longSlot.bi.isDirect;
+                btbEntry.isIndirect = longSlot.bi.isIndirect;
+                btbEntry.isCall = longSlot.bi.isCall;
+                btbEntry.isReturn = longSlot.bi.isReturn;
+                btbEntry.size = longSlot.bi.size;
+                // for conditional branches, use short slot0's counter when fused.
+                btbEntry.alwaysTaken = entry.shortSlots[0].alwaysTaken;
+                btbEntry.ctr = entry.shortSlots[0].ctr;
+                btbEntries.push_back(btbEntry);
+                DPRINTF(BTBPDede, "BTBPDede: use long slot entry way %d for bank %d alignedAddr %#lx\n",
+                    way,
+                    phyBankIdx,
+                    alignedAddr
+                );
             }
 
-            monitorTable[phyBankIdx][monitorIdx][way].rrpv = srripTouch();
-
-            if (entry.isUsePagePointer() && entry.isCrossPage) {
-                Addr pageTableIdx = entry.pageTableSet;
-                if (pageTableIdx < numPageSets && entry.pageTableWay < numPageWays) {
-                    auto &pageEntry = pageTable[pageTableIdx][entry.pageTableWay];
-                    pageEntry.rrpv = srripTouch();
-                    constexpr unsigned regionSet = 0;
-                    if (pageEntry.regionWay < numRegionWays) {
-                        regionTable[regionSet][pageEntry.regionWay].rrpv = srripTouch();
+            if (hitLongSlot) { // fused
+                monitorRrpv[phyBankIdx][monitorBTBIdx][way * shortSlots] = 0;
+                monitorRrpv[phyBankIdx][monitorBTBIdx][way * shortSlots + 1] = 0;
+                if (entry.longSlot.isCrossPage) { // cross page
+                    Addr pageBTBIdx = entry.longSlot.index;
+                    Addr pageBTBWay = entry.longSlot.way;
+                    if (pageBTBIdx < numPageSets && pageBTBWay < numPageWays) {
+                        auto &pageBTBEntry = pageBTB[pageBTBIdx][pageBTBWay];
+                        if (pageBTBEntry.valid && pageBTBEntry.way < numRegionWays &&
+                            regionBTB[0][pageBTBEntry.way].valid) {
+                            pageRrpv[pageBTBIdx][pageBTBWay] = 0;
+                            regionRrpv[0][pageBTBEntry.way] = 0;
+                        }
+                    }
+                }
+            } else {
+                for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                    if (hitShortSlot[slot]) {
+                        monitorRrpv[phyBankIdx][monitorBTBIdx][way * shortSlots + slot] = 0;
                     }
                 }
             }
         }
-
-        if (foundInVictimCache) {
-            stats.predHitVictimTimes++;
-        }
     }
-
 
     std::sort(btbEntries.begin(), btbEntries.end(),
         [](const BTBEntry &a, const BTBEntry &b) {
             return a.pc < b.pc;
         }
     );
-
-    // // prevent duplicate entries with same PC
-    // // this should happen only when victim cache and monitor table
-    // // both have entries for the same branch
-    // auto last = std::unique(btbEntries.begin(), btbEntries.end(),
-    //     [](const BTBEntry &a, const BTBEntry &b) {
-    //         return a.pc == b.pc;
-    //     }
-    // );
-    // if (last != btbEntries.end()) {
-    //     DPRINTF(BTBPDede, "BTBPDede: removed %d duplicate BTB entries with same PC\n",
-    //         std::distance(last, btbEntries.end()));
-    // }
-    // btbEntries.erase(last, btbEntries.end());
 
     if (btbEntries.size()) stats.predHitTimes++;
     else stats.predMissTimes++;
@@ -578,6 +476,352 @@ BTBPDede::checkPredictionHit(const FetchTarget &stream,
     }
 }
 
+unsigned distance(Addr pc, Addr target) {
+    Addr diff = pc ^ target;
+    unsigned dist = 0;
+    while (diff) {
+        diff = diff >> 1;
+        dist++;
+    }
+    return dist;
+}
+
+bool BTBPDede::isOverflow(Addr pc, Addr target, unsigned targetBits) {
+    Addr validTargetBits = targetBits + instShiftAmt;
+    Addr validTargetMask = mask(validTargetBits);
+    Addr targetUpper = target & ~validTargetMask;
+    Addr pcUpper = pc & ~validTargetMask;
+    Addr pcUpperOverflow = pcUpper + (1ULL << validTargetBits);
+    return targetUpper == pcUpperOverflow;
+}
+
+bool BTBPDede::isUnderflow(Addr pc, Addr target, unsigned targetBits) {
+    Addr validTargetBits = targetBits + instShiftAmt;
+    Addr validTargetMask = mask(validTargetBits);
+    Addr targetUpper = target & ~validTargetMask;
+    Addr pcUpper = pc & ~validTargetMask;
+    Addr pcUpperUnderflow = pcUpper - (1ULL << validTargetBits);
+    return targetUpper == pcUpperUnderflow;
+}
+
+bool BTBPDede::isCrossPage(Addr pc, Addr target) {
+    Addr vpnBits = ceilLog2(pageSize);
+    Addr pcVpn = pc >> vpnBits;
+    Addr targetVpn = target >> vpnBits;
+    return pcVpn != targetVpn;
+}
+
+void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &stream) {
+    Addr pc = entry.pc;
+    Addr target = entry.target;
+    bool isMispredict = stream.squashType == SQUASH_CTRL && stream.squashPC == pc;
+    bool thisBranchTaken = stream.exeTaken && stream.exeBranchInfo.pc == pc;
+
+    unsigned dist = distance(pc, target);
+
+    bool canUseShortSlot = dist <= (shortSlotTargetBits + instShiftAmt);
+
+    bool updateIsFused = !canUseShortSlot;
+    if (entry.isIndirect) updateIsFused = true;
+
+    unsigned bankIdx = getPhysicalAlignBankIdx(pc, 0);
+    unsigned monitorBTBIdx = getMonitorBTBIdx(pc);
+    unsigned monitorBTBTag = getMonitorBTBTag(pc);
+    unsigned pageBTBIdx = getPageBTBIdx(target, longSlotTargetBits);
+    unsigned vpnLower = getVpnLower(target, longSlotTargetBits);
+    unsigned vpnUpper = getVpnUpper(target, longSlotTargetBits);
+
+    auto &toUpdateSet = monitorBTB[bankIdx][monitorBTBIdx];
+    auto &toUpdateRrpvSet = monitorRrpv[bankIdx][monitorBTBIdx];
+
+    unsigned foundWay = numWays;
+    unsigned foundSlot = shortSlots;
+    for (unsigned way = 0; way < numWays; ++way) {
+        auto &entry = toUpdateSet[way];
+        if (entry.tag != monitorBTBTag) continue;
+        if (!entry.shortSlots[0].valid && !entry.shortSlots[1].valid) continue;
+        if (!entry.fused) {
+            for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                auto shortSlot = entry.shortSlots[slot];
+                if (shortSlot.bi.pc == pc) {
+                    foundWay = way;
+                    foundSlot = slot;
+                    break;
+                }
+            }
+        } else {
+            auto longSlot = entry.longSlot;
+            if (longSlot.bi.pc == pc) {
+                foundWay = way;
+                break;
+            }
+        }
+    }
+
+    unsigned foundPageWay = numPageWays;
+    for (unsigned way = 0; way < numPageWays; ++way) {
+        auto &pageBTBEntry = pageBTB[pageBTBIdx][way];
+        if (!pageBTBEntry.valid) continue;
+        if (pageBTBEntry.way >= numRegionWays) continue;
+        auto &regionBTBEntry = regionBTB[0][pageBTBEntry.way];
+        if (!regionBTBEntry.valid) continue;
+        if (pageBTBEntry.vpnLower != vpnLower) continue;
+        if (regionBTBEntry.vpnUpper != vpnUpper) continue;
+        foundPageWay = way;
+        break;
+    }
+
+    unsigned foundRegionWay = numRegionWays;
+    for (unsigned way = 0; way < numRegionWays; ++way) {
+        auto &entry = regionBTB[0][way];
+        if (!entry.valid) continue;
+        if (entry.vpnUpper != vpnUpper) continue;
+        foundRegionWay = way;
+        break;
+    }
+
+    auto writeFusedEntry = [&](MonitorEntry &toWrite) {
+        toWrite.fused = true;
+        toWrite.tag = monitorBTBTag;
+        toWrite.shortSlots[0].valid = true;
+        toWrite.longSlot.bi = BranchInfo(entry);
+        toWrite.longSlot.bi.resolved = false;
+        toWrite.longSlot.isCrossPage = isCrossPage(pc, target);
+
+        if (toWrite.longSlot.isCrossPage) {
+            toWrite.longSlot.isOverflow = false;
+            toWrite.longSlot.isUnderflow = false;
+
+            auto &pageBTBSet = pageBTB[pageBTBIdx];
+            auto &pageBTBSetRrpv = pageRrpv[pageBTBIdx];
+            auto &regionBTBSet = regionBTB[0];
+            auto &regionBTBSetRrpv = regionRrpv[0];
+            unsigned victimPageWay = numPageWays;
+            unsigned victimRegionWay = numRegionWays;
+
+            unsigned writePageWay = foundPageWay;
+            unsigned writeRegionWay = foundRegionWay;
+
+            if (foundPageWay == numPageWays) { // page btb miss
+                auto maxRrpvIt = std::max_element(pageBTBSetRrpv.begin(), pageBTBSetRrpv.end());
+                unsigned maxRrpvWay = std::distance(pageBTBSetRrpv.begin(), maxRrpvIt);
+                unsigned maxRrpv = *maxRrpvIt;
+                victimPageWay = maxRrpvWay;
+                writePageWay = victimPageWay;
+
+                auto &victimPageEntry = pageBTBSet[victimPageWay];
+                victimPageEntry.valid = true;
+                victimPageEntry.vpnLower = vpnLower;
+
+                std::transform(pageBTBSetRrpv.begin(), pageBTBSetRrpv.end(), pageBTBSetRrpv.begin(),
+                    [&](unsigned rrpv) { return rrpv + (pageMaxRrpv - maxRrpv); });
+                pageBTBSetRrpv[victimPageWay] = pageMaxRrpv - 1;
+            }
+            if (foundRegionWay == numRegionWays) { // region btb miss
+                auto maxRrpvIt = std::max_element(regionBTBSetRrpv.begin(), regionBTBSetRrpv.end());
+                unsigned maxRrpvWay = std::distance(regionBTBSetRrpv.begin(), maxRrpvIt);
+                unsigned maxRrpv = *maxRrpvIt;
+                victimRegionWay = maxRrpvWay;
+                writeRegionWay = victimRegionWay;
+
+                auto &victimRegionEntry = regionBTBSet[victimRegionWay];
+                victimRegionEntry.valid = true;
+                victimRegionEntry.vpnUpper = vpnUpper;
+
+                std::transform(regionBTBSetRrpv.begin(), regionBTBSetRrpv.end(), regionBTBSetRrpv.begin(),
+                    [&](unsigned rrpv) { return rrpv + (regionMaxRrpv - maxRrpv); });
+                regionBTBSetRrpv[victimRegionWay] = regionMaxRrpv - 1;
+            }
+            toWrite.longSlot.index = pageBTBIdx;
+            toWrite.longSlot.way = writePageWay;
+            pageBTBSet[writePageWay].way = writeRegionWay;
+        } else {
+            toWrite.longSlot.isOverflow = isOverflow(pc, target, longSlotTargetBits);
+            toWrite.longSlot.isUnderflow = isUnderflow(pc, target, longSlotTargetBits);
+        }
+    };
+
+    // entry update
+    MonitorShortSlot *writtenSlot = nullptr;
+
+    auto maxRrpvIt = std::max_element(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end());
+    unsigned maxRrpvDistance = std::distance(toUpdateRrpvSet.begin(), maxRrpvIt);
+    unsigned maxRrpvDistanceBuddy = maxRrpvDistance ^ 1;
+    unsigned maxRrpvWay = maxRrpvDistance / shortSlots;
+    unsigned maxRrpv = *maxRrpvIt;
+
+    if (foundWay == numWays) { // miss
+        if (isMispredict) {
+            // check invalid entry
+            for (unsigned way = 0; way < numWays; ++way) {
+                if (!toUpdateSet[way].shortSlots[0].valid && !toUpdateSet[way].shortSlots[1].valid) {
+                    writtenSlot = &toUpdateSet[way].shortSlots[0];
+                    if (updateIsFused) {
+                        writeFusedEntry(toUpdateSet[way]);
+                        toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
+                        toUpdateRrpvSet[way * shortSlots + 1] = monitorMaxRrpv - 1;
+                    } else {
+                        toUpdateSet[way].fused = false;
+                        toUpdateSet[way].tag = monitorBTBTag;
+                        toUpdateSet[way].shortSlots[0].valid = true;
+                        toUpdateSet[way].shortSlots[0].bi = BranchInfo(entry);
+                        toUpdateSet[way].shortSlots[0].bi.resolved = false;
+                        toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
+                    }
+                    goto _counter_update;
+                }
+            }
+            // check paritially invalid slot
+            for (unsigned way = 0; way < numWays; ++way) {
+                if (updateIsFused) continue; // fused entry cannot use partially invalid entry
+                if (toUpdateSet[way].fused) continue;
+                for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                    if (toUpdateSet[way].shortSlots[slot].valid) continue;
+                    if (toUpdateSet[way].tag != monitorBTBTag) continue;
+
+                    toUpdateSet[way].shortSlots[slot].valid = true;
+                    toUpdateSet[way].shortSlots[slot].bi = BranchInfo(entry);
+                    toUpdateSet[way].shortSlots[slot].bi.resolved = false;
+
+                    toUpdateRrpvSet[way * shortSlots + slot] = monitorMaxRrpv - 1;
+                    writtenSlot = &toUpdateSet[way].shortSlots[slot];
+                    goto _counter_update;
+                }
+            }
+            // if no invalid entry, need to replace the entry with max RRPV
+            if (updateIsFused == toUpdateSet[maxRrpvWay].fused) {
+                if (updateIsFused) { // write fused entry with fused entry
+                    writeFusedEntry(toUpdateSet[maxRrpvWay]);
+                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
+                } else { // write unfused entry with unfused entry
+                    bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
+                    toUpdateSet[maxRrpvWay].fused = false;
+                    toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
+                    auto writeShortSlot = [&](MonitorShortSlot &slot) {
+                        slot.valid = true;
+                        slot.bi = BranchInfo(entry);
+                        slot.bi.resolved = false;
+                    };
+                    if (maxRrpvDistance % shortSlots == 0) {
+                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
+                        if (retagged) {
+                            toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
+                        }
+                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                    } else {
+                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
+                        if (retagged) {
+                            toUpdateSet[maxRrpvWay].shortSlots[0].valid = false;
+                        }
+                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
+                    }
+
+                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                }
+            } else if (updateIsFused && !toUpdateSet[maxRrpvWay].fused) { // write fused entry with unfused entry
+                unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
+                if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
+                    writeFusedEntry(toUpdateSet[maxRrpvWay]);
+                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
+                } else { // recently used
+                    // check all fused entries to find the most rrpv one to replace
+                    unsigned fusedVictimWay = numWays;
+                    unsigned fusedVictimRrpv = 0;
+                    for (unsigned way = 0; way < numWays; ++way) {
+                        if (!toUpdateSet[way].fused) continue;
+                        if (toUpdateRrpvSet[way * shortSlots] > fusedVictimRrpv) {
+                            fusedVictimWay = way;
+                            fusedVictimRrpv = toUpdateRrpvSet[way * shortSlots];
+                        }
+                    }
+                    // if has fused entry with higher RRPV, replace it;
+                    if (fusedVictimWay != numWays) {
+                        writeFusedEntry(toUpdateSet[fusedVictimWay]);
+                        writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
+                        toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
+                        toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                    } else { // no fused entry, replace unfused entry which has the least sum of rrpv
+                        unsigned unfusedVictimWay = numWays;
+                        unsigned unfusedVictimRrpvSum = 0;
+                        for (unsigned way = 0; way < numWays; ++way) {
+                            if (toUpdateSet[way].fused) continue;
+                            unsigned rrpvSum = toUpdateRrpvSet[way * shortSlots] + \
+                                toUpdateRrpvSet[way * shortSlots + 1];
+                            if (rrpvSum > unfusedVictimRrpvSum) {
+                                unfusedVictimWay = way;
+                                unfusedVictimRrpvSum = rrpvSum;
+                            }
+                        }
+                        writeFusedEntry(toUpdateSet[unfusedVictimWay]);
+                        writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
+                        toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
+                        toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                    }
+                }
+            } else { // write unfused entry with fused entry
+                toUpdateSet[maxRrpvWay].fused = false;
+                toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
+                toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
+                toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
+                toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
+                toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
+                writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+
+                std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                    [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
+            }
+        }
+    } else { // hit
+        if (foundSlot != shortSlots) { // hit short slot
+            auto &slot = toUpdateSet[foundWay].shortSlots[foundSlot];
+            slot.bi = BranchInfo(entry);
+            slot.bi.resolved = false;
+            writtenSlot = &slot;
+            toUpdateRrpvSet[foundWay * shortSlots + foundSlot] = 0;
+        } else { // hit long slot
+            writeFusedEntry(toUpdateSet[foundWay]);
+            // for fused entry, short slot 0 is used to store meta info and counter
+            writtenSlot = &toUpdateSet[foundWay].shortSlots[0];
+            toUpdateRrpvSet[foundWay * shortSlots] = 0;
+            toUpdateRrpvSet[foundWay * shortSlots + 1] = 0;
+        }
+    }
+
+_counter_update:
+    // counter update
+    if (writtenSlot) {
+        if (entry.isCond) {
+            if (thisBranchTaken) {
+                if (isMispredict) {
+                    writtenSlot->alwaysTaken = true;
+                    writtenSlot->ctr = 0;
+                } else {
+                    if (writtenSlot->ctr < 1) writtenSlot->ctr++;
+                }
+            } else {
+                if (isMispredict) {
+                    writtenSlot->alwaysTaken = false;
+                    writtenSlot->ctr = -1;
+                } else {
+                    if (writtenSlot->ctr > -2) writtenSlot->ctr--;
+                }
+            }
+        }
+    }
+}
+
 void BTBPDede::update(const FetchTarget& stream) {
     DPRINTF(BTBPDede, "===== BTBPDede: update called for exePC %#lx =====\n", stream.exeBranchInfo.pc);
 
@@ -589,267 +833,7 @@ void BTBPDede::update(const FetchTarget& stream) {
 
     auto entries_need_update = prepareUpdateEntries(stream);
     for (const auto &entry_to_update : entries_need_update) {
-        BranchInfo exec = entry_to_update;
-        unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
-        unsigned monitorIdx = getMonitorIdx(exec.pc);
-        unsigned monitorTag = getMonitorTag(exec.pc);
-        unsigned pageTableIdx = getPageTableIdx(exec.target);
-        unsigned pageTableTag = getPageTableTag(exec.target);
-
-        bool isRVC = (exec.size == 2);
-        unsigned offset = exec.pc & (blockSize - 1);
-        unsigned alignedPosition = isRVC ? (offset >> 1) : ((offset + 2) >> 1);
-
-        auto &toUpdate = monitorTable[alignedBankIdx][monitorIdx];
-
-        BranchAttribute execAttr({
-            exec.isCond ? BranchAttribute::BranchTypeEnum::Conditional :
-                (exec.isIndirect ? BranchAttribute::BranchTypeEnum::Indirect :
-                    BranchAttribute::BranchTypeEnum::Direct),
-            exec.isReturn ? BranchAttribute::RasActionEnum::Pop :
-                (exec.isCall ? BranchAttribute::RasActionEnum::Push :
-                    BranchAttribute::RasActionEnum::None)
-        });
-
-        unsigned foundWay = numWays;
-        for (unsigned way = 0; way < numWays; ++way) {
-            auto &entry = toUpdate[way];
-            if (!entry.valid) continue;
-            if (entry.position != alignedPosition) continue;
-            if (entry.tag != monitorTag) continue;
-            foundWay = way;
-            stats.updateHitTimes++;
-            break;
-        }
-
-        unsigned foundVictimWay = numVictimCacheSets;
-        for (unsigned way = 0; way < numVictimCacheSets; ++way) {
-            auto &entry = victimCache[alignedBankIdx][way];
-            Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
-
-            if (!entry.valid) continue;
-            if (entry.position != alignedPosition) continue;
-            if (entry.tag != victimTag) continue;
-
-            foundVictimWay = way;
-            stats.updateHitVictimTimes++;
-            break;
-        }
-        if (foundWay != numWays && foundVictimWay != numVictimCacheSets) {
-            stats.updateMultiHitTimes++;
-        }
-
-        TargetCarry shortCarry = computeCarryBits(exec.pc, exec.target, maxOffsetBits);
-        bool isCrossPage = shortCarry.isNone();
-
-        MonitorEntry newEntry;
-        newEntry.valid = true;
-        newEntry.isCrossPage = isCrossPage;
-        newEntry.alwaysTaken = true;
-        newEntry.isRVC = isRVC;
-        newEntry.position = alignedPosition;
-        newEntry.tag = monitorTag;
-        newEntry.targetOffset = (exec.target >> instShiftAmt) & mask(maxOffsetBits);
-        newEntry.attr = execAttr;
-        newEntry.targetCarry = shortCarry;
-        newEntry.rrpv = insertRRPV;
-        newEntry.pageTableSet = pageTableIdx;
-
-        if (isCrossPage) {
-            stats.updateUsePagePointerTimes++;
-            newEntry.targetCarry.targetCarry = TargetCarry::TargetCarryEnum::None;
-
-            Addr regionTableTag = getRegionTableTag(exec.target);
-
-            constexpr unsigned regionSet = 0;
-            unsigned regionTableWay = numRegionWays;
-            bool regionHit = false;
-            for (unsigned way = 0; way < numRegionWays; ++way) {
-                auto &regionEntry = regionTable[regionSet][way];
-                if (!regionEntry.valid) continue;
-                if (regionEntry.tag != regionTableTag) continue;
-
-                regionTableWay = way;
-                regionHit = true;
-                break;
-            }
-
-            if (regionTableWay == numRegionWays) {
-                regionTableWay = findOrSelectSRRIPWay(regionTable[regionSet]);
-            }
-
-            auto &regionEntry = regionTable[regionSet][regionTableWay];
-            regionEntry.valid = true;
-            regionEntry.tag = regionTableTag;
-            regionEntry.rrpv = regionHit ? srripTouch() : insertRRPV;
-
-            unsigned pageTableWay = numPageWays;
-            bool pageHit = false;
-            for (unsigned way = 0; way < numPageWays; ++way) {
-                auto &pageEntry = pageTable[pageTableIdx][way];
-                if (!pageEntry.valid) continue;
-                Addr entryTag = pageEntry.tag;
-                if (entryTag != pageTableTag) continue;
-
-                pageTableWay = way;
-                pageHit = true;
-                break;
-            }
-            if (pageTableWay == numPageWays) {
-                stats.updateAllocatePagePointerTimes++;
-
-                pageTableWay = findOrSelectSRRIPWay(pageTable[pageTableIdx]);
-
-                auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
-                pageEntry.valid = true;
-                pageEntry.tag = getPageTableTag(exec.target);
-
-                DPRINTF(BTBPDede, "BTBPDede: updating page entry at set %d, way %d\n",
-                    pageTableIdx, pageTableWay);
-                DPRINTF(BTBPDede, "BTBPDede: updated page entry details:\n");
-                printPageEntry(pageEntry);
-            }
-
-            auto &pageEntry = pageTable[pageTableIdx][pageTableWay];
-            pageEntry.valid = true;
-            pageEntry.tag = getPageTableTag(exec.target);
-            pageEntry.regionWay = regionTableWay;
-            pageEntry.rrpv = pageHit ? srripTouch() : insertRRPV;
-
-            newEntry.pageTableWay = pageTableWay;
-        } else {
-            newEntry.ctr = 0;
-        }
-
-        if (!isCrossPage &&
-            execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
-            if (foundWay != numWays) {
-                newEntry.ctr = toUpdate[foundWay].ctr;
-                newEntry.alwaysTaken = toUpdate[foundWay].alwaysTaken;
-            } else if (foundVictimWay != numVictimCacheSets) {
-                newEntry.ctr = victimCache[alignedBankIdx][foundVictimWay].ctr;
-                newEntry.alwaysTaken =
-                    victimCache[alignedBankIdx][foundVictimWay].alwaysTaken;
-            }
-
-            bool this_cond_taken =
-                stream.exeTaken && stream.getControlPC() == exec.pc;
-            if (!this_cond_taken) {
-                newEntry.alwaysTaken = false;
-            }
-            if (!newEntry.alwaysTaken) {
-                if (this_cond_taken && newEntry.ctr < 1) {
-                    newEntry.ctr++;
-                }
-                if (!this_cond_taken && newEntry.ctr > -2) {
-                    newEntry.ctr--;
-                }
-            }
-        }
-
-        stats.updateTotal++;
-        if (foundWay != numWays) {
-            if (toUpdate[foundWay].targetOffset != newEntry.targetOffset) {
-                stats.updateFixTarget++;
-            }
-            toUpdate[foundWay] = newEntry;
-            toUpdate[foundWay].rrpv = srripTouch();
-            stats.updateExisting++;
-
-            DPRINTF(BTBPDede,
-                "BTBPDede: updated existing monitor entry at bank %d, index %d, way %d\n",
-                alignedBankIdx, monitorIdx, foundWay);
-
-            if (foundVictimWay != numVictimCacheSets) {
-                DPRINTF(BTBPDede,
-                    "BTBPDede: deduplicating victim cache entry at bank %d, way %d\n",
-                    alignedBankIdx, foundVictimWay);
-                victimCache[alignedBankIdx][foundVictimWay].valid = false;
-            }
-        } else if (foundVictimWay != numVictimCacheSets) {
-            auto &victimEntry = victimCache[alignedBankIdx][foundVictimWay];
-            if (victimEntry.targetOffset != newEntry.targetOffset) {
-                stats.updateFixTarget++;
-            }
-            victimEntry = newEntry;
-            victimEntry.tag = getVictimCacheTag(monitorTag, monitorIdx);
-            victimEntry.rrpv = srripTouch();
-            stats.updateInVC++;
-
-            DPRINTF(BTBPDede,
-                "BTBPDede: updated existing victim cache entry at bank %d, way %d\n",
-                alignedBankIdx, foundVictimWay);
-        } else {
-            if (!stream.exeTaken &&
-                execAttr.branchType == BranchAttribute::BranchTypeEnum::Conditional) {
-                DPRINTF(BTBPDede,
-                    "BTBPDede: skip allocation for not taken conditional branch\n");
-                continue;
-            }
-
-            stats.updateMissTimes++;
-
-            unsigned evictWay = numWays;
-            for (unsigned i = 0; i < numWays; ++i) {
-                auto &entry = toUpdate[i];
-                if (!entry.valid) {
-                    evictWay = i;
-                    stats.updateFoundEmptyTimes++;
-                    DPRINTF(BTBPDede,
-                        "BTBPDede: found empty way %d for bank %d idx %#lx\n",
-                        evictWay, alignedBankIdx, monitorIdx);
-                    break;
-                }
-            }
-
-            if (evictWay == numWays) {
-                stats.updateEvictTimes++;
-                evictWay = findOrSelectSRRIPWay(toUpdate);
-                stats.updateReplace++;
-
-                DPRINTF(BTBPDede, "BTBPDede: evicting way %d for bank %d idx %#lx\n",
-                    evictWay, alignedBankIdx, monitorIdx);
-            }
-
-            const auto &toEvictEntry = toUpdate[evictWay];
-            if (toEvictEntry.valid && evictWay < numWays) {
-                stats.updateReplaceValidOne++;
-            }
-
-            if (toEvictEntry.valid && victimCacheEntries != 0) {
-                unsigned victimWay = numVictimCacheSets;
-                for (unsigned way = 0; way < numVictimCacheSets; way++) {
-                    auto &victimEntry = victimCache[alignedBankIdx][way];
-                    if (!victimEntry.valid) {
-                        victimWay = way;
-                        DPRINTF(BTBPDede,
-                            "BTBPDede: found empty victim cache way %d for bank %d\n",
-                            victimWay, alignedBankIdx);
-                        break;
-                    }
-                    if (victimEntry.tag !=
-                        getVictimCacheTag(toEvictEntry.tag, monitorIdx)) continue;
-                    if (victimEntry.position != toEvictEntry.position) continue;
-                    victimWay = way;
-                    break;
-                }
-
-                if (victimWay == numVictimCacheSets) {
-                    victimWay = findOrSelectSRRIPWay(victimCache[alignedBankIdx]);
-                    DPRINTF(BTBPDede,
-                        "BTBPDede: evicting victim cache way %d for bank %d\n",
-                        victimWay, alignedBankIdx);
-                }
-
-                auto &victimEntry = victimCache[alignedBankIdx][victimWay];
-                victimEntry = toEvictEntry;
-                victimEntry.tag = getVictimCacheTag(toEvictEntry.tag, monitorIdx);
-                victimEntry.rrpv = insertRRPV;
-            }
-
-            toUpdate[evictWay] = newEntry;
-            toUpdate[evictWay].rrpv = insertRRPV;
-        }
+       updateResolvedEntry(entry_to_update, stream);
     }
 }
 
@@ -869,18 +853,11 @@ void BTBPDede::dumpBTBEntries(const std::vector<BTBEntry>& es) {
 }
 
 void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
-    DPRINTF(BTBPDede, "MonitorEntry: offsetBits:%d, usePagePointer:%d, valid:%d, isCrossPage:%d, "
-        "position:%d, tag:%#lx, targetOffset:%#lx, pagePointerSet:%#lx, "
-        "pagePointerWay:%u, ctr:%d, carry:%d, rrpv:%u, attr:(branchType:%d, rasAction:%d)\n",
-        e.getOffsetBits(), e.isUsePagePointer(), e.valid, e.isCrossPage,
-        e.position, e.tag, e.targetOffset, e.pageTableSet,
-        e.pageTableWay, e.ctr, (int)e.targetCarry.targetCarry, e.rrpv,
-        (int)e.attr.branchType, (int)e.attr.rasAction);
+
 }
 
 void BTBPDede::printPageEntry(const PageEntry& e) {
-    DPRINTF(BTBPDede, "PageEntry: valid:%d, tag:%#lx, regionWay:%#lx, rrpv:%u\n",
-        e.valid, e.tag, e.regionWay, e.rrpv);
+
 }
 
 void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)
@@ -920,13 +897,13 @@ void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)
                 pred_branch_hit, stream.exeTaken);
     }
 
+    entry_to_write.tag = getMonitorBTBTag(entry_to_write.pc);
     stream.updateNewBTBEntry = entry_to_write;
     stream.updateIsOldEntry = is_old_entry;
 }
 
 void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
     auto meta = std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
-    const auto &rawEntries = meta->rawMonitorSets;
     const auto &btbEntries = meta->btbEntries;
 
     auto pc = inst->getPC();
@@ -980,74 +957,24 @@ void BTBPDede::commitBranch(const FetchTarget &stream, const DynInstPtr &inst) {
         if (!inst->isNonSpeculative()) {
             if (inst->isIndirectCtrl()) {
                 stats.indirectHits++;
-                bool found_raw_entry = false;
-                bool entry_cross_page = false;
-                bool entry_use_page_pointer = false;
-                TargetCarry::TargetCarryEnum entry_carry = TargetCarry::TargetCarryEnum::None;
-                unsigned offset = pc & (blockSize - 1);
-                bool is_rvc = (entry.size == 2);
-                unsigned aligned_position = is_rvc ? (offset >> 1) : ((offset + 2) >> 1);
-                Addr monitor_tag = getMonitorTag(pc);
-                for (const auto &bank : rawEntries) {
-                    for (const auto &me : bank) {
-                        if (!me.valid) {
-                            continue;
-                        }
-                        if (me.position == aligned_position && me.tag == monitor_tag) {
-                            found_raw_entry = true;
-                            entry_cross_page = me.isCrossPage;
-                            entry_use_page_pointer = me.isUsePagePointer();
-                            entry_carry = me.targetCarry.targetCarry;
-                            break;
-                        }
-                    }
-                    if (found_raw_entry) {
-                        break;
-                    }
-                }
-                if (found_raw_entry) {
-                    stats.indirectMetaFound++;
-                } else {
-                    stats.indirectMetaNotFound++;
-                }
-                if (found_raw_entry && entry_cross_page) {
+                stats.indirectMetaFound++;
+
+                Addr predTarget = entry.target;
+                bool predCrossPage = isCrossPage(pc, predTarget);
+                if (predCrossPage) {
                     stats.indirectHitCrossPage++;
-                } else if (found_raw_entry) {
+                } else {
                     stats.indirectHitNonCrossPage++;
                 }
-                Addr pred_target = entry.target;
-                if (pred_target == npc) {
+
+                if (predTarget == npc) {
                     stats.indirectPredCorrect++;
                 } else {
                     stats.indirectPredWrong++;
-                    if (found_raw_entry && entry_cross_page) {
+                    if (predCrossPage) {
                         stats.indirectPredWrongCrossPage++;
-                    } else if (found_raw_entry) {
+                    } else {
                         stats.indirectPredWrongNonCrossPage++;
-                    }
-                    if (found_raw_entry && !entry_cross_page) {
-                        switch (entry_carry) {
-                          case TargetCarry::TargetCarryEnum::Fit:
-                            stats.indirectPredWrongCarryFit++;
-                            break;
-                          case TargetCarry::TargetCarryEnum::PlusOne:
-                            stats.indirectPredWrongCarryPlusOne++;
-                            break;
-                          case TargetCarry::TargetCarryEnum::MinusOne:
-                            stats.indirectPredWrongCarryMinusOne++;
-                            break;
-                          case TargetCarry::TargetCarryEnum::None:
-                          default:
-                            stats.indirectPredWrongCarryNone++;
-                            break;
-                        }
-                    }
-                    if (found_raw_entry) {
-                        if (entry_use_page_pointer) {
-                            stats.indirectPredWrongUsePagePointer++;
-                        } else {
-                            stats.indirectPredWrongNoPagePointer++;
-                        }
                     }
                 }
             }
