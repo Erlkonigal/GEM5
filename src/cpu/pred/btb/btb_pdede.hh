@@ -57,9 +57,9 @@ private:
     struct MonitorShortSlot
     {
         bool valid = 0;
-        bool alwaysTaken;
+        bool alwaysTaken = true;
         BranchInfo bi;
-        int ctr;
+        int ctr = 0;
     };
 
     struct MonitorLongSlot
@@ -174,26 +174,19 @@ private:
         Scalar updateTimes;
         Scalar updateMiss;
         Scalar updateHit;
-        Scalar updateMissTimes;
-        Scalar updateFoundEmptyTimes;
-        Scalar updateEvictTimes;
 
-        Scalar updateHitTimes;
-        Scalar updateHitVictimTimes;
-        Scalar updateMultiHitTimes;
-        Scalar updateExisting;
-        Scalar updateReplace;
-        Scalar updateReplaceValidOne;
-        Scalar updateInVC;
-        Scalar updateTotal;
-        Scalar updateFixTarget;
+        Scalar updateLookupMiss;
+        Scalar updateLookupMissNoAllocate;
+        Scalar updateLookupHitShortSlot;
+        Scalar updateLookupHitLongSlot;
 
-        Scalar updateUsePagePointerTimes;
-        Scalar updateAllocatePagePointerTimes;
-        Scalar updateNotUseButHasPagePointerTimes;
-        Scalar updateNotUseAndNoPagePointerTimes;
-
-        Scalar carryOverflowTimes;
+        Scalar updateWriteInvalidWay;
+        Scalar updateWritePartialInvalidSlot;
+        Scalar updateWriteReplaceSameType;
+        Scalar updateWriteFuseOnUnfusedWay;
+        Scalar updateWriteUnfusedOnFusedWay;
+        Scalar updateWriteFusedVictimFused;
+        Scalar updateWriteFusedVictimUnfused;
 
         Scalar allBranchHits;
         Scalar totalBranchHits;
@@ -226,12 +219,6 @@ private:
         Scalar indirectHitNonCrossPage;
         Scalar indirectPredWrongCrossPage;
         Scalar indirectPredWrongNonCrossPage;
-        Scalar indirectPredWrongCarryFit;
-        Scalar indirectPredWrongCarryPlusOne;
-        Scalar indirectPredWrongCarryMinusOne;
-        Scalar indirectPredWrongCarryNone;
-        Scalar indirectPredWrongUsePagePointer;
-        Scalar indirectPredWrongNoPagePointer;
 
         Scalar callHits;
         Scalar callMisses;

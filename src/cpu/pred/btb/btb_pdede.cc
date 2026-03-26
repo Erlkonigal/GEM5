@@ -528,8 +528,8 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     unsigned monitorBTBIdx = getMonitorBTBIdx(pc);
     unsigned monitorBTBTag = getMonitorBTBTag(pc);
     unsigned pageBTBIdx = getPageBTBIdx(target, longSlotTargetBits);
-    unsigned vpnLower = getVpnLower(target, longSlotTargetBits);
-    unsigned vpnUpper = getVpnUpper(target, longSlotTargetBits);
+    Addr vpnLower = getVpnLower(target, longSlotTargetBits);
+    Addr vpnUpper = getVpnUpper(target, longSlotTargetBits);
 
     auto &toUpdateSet = monitorBTB[bankIdx][monitorBTBIdx];
     auto &toUpdateRrpvSet = monitorRrpv[bankIdx][monitorBTBIdx];
@@ -580,13 +580,28 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         break;
     }
 
+    if (foundWay == numWays) {
+        stats.updateLookupMiss++;
+    } else if (foundSlot != shortSlots) {
+        stats.updateLookupHitShortSlot++;
+    } else {
+        stats.updateLookupHitLongSlot++;
+    }
+
     auto writeFusedEntry = [&](MonitorEntry &toWrite) {
         toWrite.fused = true;
         toWrite.tag = monitorBTBTag;
         toWrite.shortSlots[0].valid = true;
         toWrite.longSlot.bi = BranchInfo(entry);
         toWrite.longSlot.bi.resolved = false;
-        toWrite.longSlot.isCrossPage = isCrossPage(pc, target);
+
+        bool crossPage = isCrossPage(pc, target);
+        bool overflow = isOverflow(pc, target, longSlotTargetBits);
+        bool underflow = isUnderflow(pc, target, longSlotTargetBits);
+
+        toWrite.longSlot.isCrossPage = crossPage && (!overflow && !underflow);
+        toWrite.longSlot.isOverflow = overflow;
+        toWrite.longSlot.isUnderflow = underflow;
 
         if (toWrite.longSlot.isCrossPage) {
             toWrite.longSlot.isOverflow = false;
@@ -608,14 +623,11 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 unsigned maxRrpv = *maxRrpvIt;
                 victimPageWay = maxRrpvWay;
                 writePageWay = victimPageWay;
-
-                auto &victimPageEntry = pageBTBSet[victimPageWay];
-                victimPageEntry.valid = true;
-                victimPageEntry.vpnLower = vpnLower;
-
                 std::transform(pageBTBSetRrpv.begin(), pageBTBSetRrpv.end(), pageBTBSetRrpv.begin(),
                     [&](unsigned rrpv) { return rrpv + (pageMaxRrpv - maxRrpv); });
                 pageBTBSetRrpv[victimPageWay] = pageMaxRrpv - 1;
+            } else {
+                pageBTBSetRrpv[writePageWay] = 0;
             }
             if (foundRegionWay == numRegionWays) { // region btb miss
                 auto maxRrpvIt = std::max_element(regionBTBSetRrpv.begin(), regionBTBSetRrpv.end());
@@ -624,20 +636,19 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 victimRegionWay = maxRrpvWay;
                 writeRegionWay = victimRegionWay;
 
-                auto &victimRegionEntry = regionBTBSet[victimRegionWay];
-                victimRegionEntry.valid = true;
-                victimRegionEntry.vpnUpper = vpnUpper;
-
                 std::transform(regionBTBSetRrpv.begin(), regionBTBSetRrpv.end(), regionBTBSetRrpv.begin(),
                     [&](unsigned rrpv) { return rrpv + (regionMaxRrpv - maxRrpv); });
                 regionBTBSetRrpv[victimRegionWay] = regionMaxRrpv - 1;
+            } else {
+                regionBTBSetRrpv[writeRegionWay] = 0;
             }
             toWrite.longSlot.index = pageBTBIdx;
             toWrite.longSlot.way = writePageWay;
+            pageBTBSet[writePageWay].valid = true;
+            pageBTBSet[writePageWay].vpnLower = vpnLower;
             pageBTBSet[writePageWay].way = writeRegionWay;
-        } else {
-            toWrite.longSlot.isOverflow = isOverflow(pc, target, longSlotTargetBits);
-            toWrite.longSlot.isUnderflow = isUnderflow(pc, target, longSlotTargetBits);
+            regionBTBSet[writeRegionWay].valid = true;
+            regionBTBSet[writeRegionWay].vpnUpper = vpnUpper;
         }
     };
 
@@ -651,137 +662,147 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     unsigned maxRrpv = *maxRrpvIt;
 
     if (foundWay == numWays) { // miss
-        if (isMispredict) {
-            // check invalid entry
-            for (unsigned way = 0; way < numWays; ++way) {
-                if (!toUpdateSet[way].shortSlots[0].valid && !toUpdateSet[way].shortSlots[1].valid) {
-                    writtenSlot = &toUpdateSet[way].shortSlots[0];
-                    if (updateIsFused) {
-                        writeFusedEntry(toUpdateSet[way]);
-                        toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
-                        toUpdateRrpvSet[way * shortSlots + 1] = monitorMaxRrpv - 1;
-                    } else {
-                        toUpdateSet[way].fused = false;
-                        toUpdateSet[way].tag = monitorBTBTag;
-                        toUpdateSet[way].shortSlots[0].valid = true;
-                        toUpdateSet[way].shortSlots[0].bi = BranchInfo(entry);
-                        toUpdateSet[way].shortSlots[0].bi.resolved = false;
-                        toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
-                    }
-                    goto _counter_update;
+        // check not taken conditional branch
+        if (entry.isCond && !thisBranchTaken) {
+            return;
+        }
+        // check invalid entry
+        for (unsigned way = 0; way < numWays; ++way) {
+            if (!toUpdateSet[way].shortSlots[0].valid && !toUpdateSet[way].shortSlots[1].valid) {
+                stats.updateWriteInvalidWay++;
+                writtenSlot = &toUpdateSet[way].shortSlots[0];
+                if (updateIsFused) {
+                    writeFusedEntry(toUpdateSet[way]);
+                    toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[way * shortSlots + 1] = monitorMaxRrpv - 1;
+                } else {
+                    toUpdateSet[way].fused = false;
+                    toUpdateSet[way].tag = monitorBTBTag;
+                    toUpdateSet[way].shortSlots[0].valid = true;
+                    toUpdateSet[way].shortSlots[0].bi = BranchInfo(entry);
+                    toUpdateSet[way].shortSlots[0].bi.resolved = false;
+                    toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
                 }
+                goto _counter_update;
             }
-            // check paritially invalid slot
-            for (unsigned way = 0; way < numWays; ++way) {
-                if (updateIsFused) continue; // fused entry cannot use partially invalid entry
-                if (toUpdateSet[way].fused) continue;
-                for (unsigned slot = 0; slot < shortSlots; ++slot) {
-                    if (toUpdateSet[way].shortSlots[slot].valid) continue;
-                    if (toUpdateSet[way].tag != monitorBTBTag) continue;
+        }
+        // check paritially invalid slot
+        for (unsigned way = 0; way < numWays; ++way) {
+            if (updateIsFused) continue; // fused entry cannot use partially invalid entry
+            if (toUpdateSet[way].fused) continue;
+            for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                if (toUpdateSet[way].shortSlots[slot].valid) continue;
+                if (toUpdateSet[way].tag != monitorBTBTag) continue;
 
-                    toUpdateSet[way].shortSlots[slot].valid = true;
-                    toUpdateSet[way].shortSlots[slot].bi = BranchInfo(entry);
-                    toUpdateSet[way].shortSlots[slot].bi.resolved = false;
+                stats.updateWritePartialInvalidSlot++;
 
-                    toUpdateRrpvSet[way * shortSlots + slot] = monitorMaxRrpv - 1;
-                    writtenSlot = &toUpdateSet[way].shortSlots[slot];
-                    goto _counter_update;
-                }
+                toUpdateSet[way].shortSlots[slot].valid = true;
+                toUpdateSet[way].shortSlots[slot].bi = BranchInfo(entry);
+                toUpdateSet[way].shortSlots[slot].bi.resolved = false;
+
+                toUpdateRrpvSet[way * shortSlots + slot] = monitorMaxRrpv - 1;
+                writtenSlot = &toUpdateSet[way].shortSlots[slot];
+                goto _counter_update;
             }
-            // if no invalid entry, need to replace the entry with max RRPV
-            if (updateIsFused == toUpdateSet[maxRrpvWay].fused) {
-                if (updateIsFused) { // write fused entry with fused entry
-                    writeFusedEntry(toUpdateSet[maxRrpvWay]);
-                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
-                } else { // write unfused entry with unfused entry
-                    bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
-                    toUpdateSet[maxRrpvWay].fused = false;
-                    toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
-                    auto writeShortSlot = [&](MonitorShortSlot &slot) {
-                        slot.valid = true;
-                        slot.bi = BranchInfo(entry);
-                        slot.bi.resolved = false;
-                    };
-                    if (maxRrpvDistance % shortSlots == 0) {
-                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
-                        if (retagged) {
-                            toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
-                        }
-                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                    } else {
-                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
-                        if (retagged) {
-                            toUpdateSet[maxRrpvWay].shortSlots[0].valid = false;
-                        }
-                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
-                    }
-
-                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                }
-            } else if (updateIsFused && !toUpdateSet[maxRrpvWay].fused) { // write fused entry with unfused entry
-                unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
-                if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
-                    writeFusedEntry(toUpdateSet[maxRrpvWay]);
-                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
-                } else { // recently used
-                    // check all fused entries to find the most rrpv one to replace
-                    unsigned fusedVictimWay = numWays;
-                    unsigned fusedVictimRrpv = 0;
-                    for (unsigned way = 0; way < numWays; ++way) {
-                        if (!toUpdateSet[way].fused) continue;
-                        if (toUpdateRrpvSet[way * shortSlots] > fusedVictimRrpv) {
-                            fusedVictimWay = way;
-                            fusedVictimRrpv = toUpdateRrpvSet[way * shortSlots];
-                        }
-                    }
-                    // if has fused entry with higher RRPV, replace it;
-                    if (fusedVictimWay != numWays) {
-                        writeFusedEntry(toUpdateSet[fusedVictimWay]);
-                        writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
-                        toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
-                        toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
-                    } else { // no fused entry, replace unfused entry which has the least sum of rrpv
-                        unsigned unfusedVictimWay = numWays;
-                        unsigned unfusedVictimRrpvSum = 0;
-                        for (unsigned way = 0; way < numWays; ++way) {
-                            if (toUpdateSet[way].fused) continue;
-                            unsigned rrpvSum = toUpdateRrpvSet[way * shortSlots] + \
-                                toUpdateRrpvSet[way * shortSlots + 1];
-                            if (rrpvSum > unfusedVictimRrpvSum) {
-                                unfusedVictimWay = way;
-                                unfusedVictimRrpvSum = rrpvSum;
-                            }
-                        }
-                        writeFusedEntry(toUpdateSet[unfusedVictimWay]);
-                        writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
-                        toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
-                        toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
-                    }
-                }
-            } else { // write unfused entry with fused entry
+        }
+        // if no invalid entry, need to replace the entry with max RRPV
+        if (updateIsFused == toUpdateSet[maxRrpvWay].fused) {
+            stats.updateWriteReplaceSameType++;
+            if (updateIsFused) { // write fused entry with fused entry
+                writeFusedEntry(toUpdateSet[maxRrpvWay]);
+                writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                    [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
+            } else { // write unfused entry with unfused entry
+                bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
                 toUpdateSet[maxRrpvWay].fused = false;
                 toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
-                toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
-                toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
-                toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
-                toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
-                writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                auto writeShortSlot = [&](MonitorShortSlot &slot) {
+                    slot.valid = true;
+                    slot.bi = BranchInfo(entry);
+                    slot.bi.resolved = false;
+                };
+                if (maxRrpvDistance % shortSlots == 0) {
+                    writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
+                    if (retagged) {
+                        toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
+                    }
+                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                } else {
+                    writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
+                    if (retagged) {
+                        toUpdateSet[maxRrpvWay].shortSlots[0].valid = false;
+                    }
+                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
+                }
 
                 std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
                     [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
                 toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
             }
+        } else if (updateIsFused && !toUpdateSet[maxRrpvWay].fused) { // write fused entry with unfused entry
+            stats.updateWriteFuseOnUnfusedWay++;
+            unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
+            if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
+                writeFusedEntry(toUpdateSet[maxRrpvWay]);
+                writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                    [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
+            } else { // recently used
+                // check all fused entries to find the most rrpv one to replace
+                unsigned fusedVictimWay = numWays;
+                unsigned fusedVictimRrpv = 0;
+                for (unsigned way = 0; way < numWays; ++way) {
+                    if (!toUpdateSet[way].fused) continue;
+                    if (toUpdateRrpvSet[way * shortSlots] > fusedVictimRrpv) {
+                        fusedVictimWay = way;
+                        fusedVictimRrpv = toUpdateRrpvSet[way * shortSlots];
+                    }
+                }
+                // if has fused entry with higher RRPV, replace it;
+                if (fusedVictimWay != numWays) {
+                    stats.updateWriteFusedVictimFused++;
+                    writeFusedEntry(toUpdateSet[fusedVictimWay]);
+                    writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
+                    toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                } else { // no fused entry, replace unfused entry which has the least sum of rrpv
+                    stats.updateWriteFusedVictimUnfused++;
+                    unsigned unfusedVictimWay = numWays;
+                    unsigned unfusedVictimRrpvSum = 0;
+                    for (unsigned way = 0; way < numWays; ++way) {
+                        if (toUpdateSet[way].fused) continue;
+                        unsigned rrpvSum = toUpdateRrpvSet[way * shortSlots] + \
+                            toUpdateRrpvSet[way * shortSlots + 1];
+                        if (rrpvSum > unfusedVictimRrpvSum) {
+                            unfusedVictimWay = way;
+                            unfusedVictimRrpvSum = rrpvSum;
+                        }
+                    }
+                    writeFusedEntry(toUpdateSet[unfusedVictimWay]);
+                    writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
+                    toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                }
+            }
+        } else { // write unfused entry with fused entry
+            stats.updateWriteUnfusedOnFusedWay++;
+            toUpdateSet[maxRrpvWay].fused = false;
+            toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
+            toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
+            toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
+            toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
+            toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
+            writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+
+            std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+            toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+            toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
         }
     } else { // hit
         if (foundSlot != shortSlots) { // hit short slot
@@ -792,7 +813,6 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
             toUpdateRrpvSet[foundWay * shortSlots + foundSlot] = 0;
         } else { // hit long slot
             writeFusedEntry(toUpdateSet[foundWay]);
-            // for fused entry, short slot 0 is used to store meta info and counter
             writtenSlot = &toUpdateSet[foundWay].shortSlots[0];
             toUpdateRrpvSet[foundWay * shortSlots] = 0;
             toUpdateRrpvSet[foundWay * shortSlots + 1] = 0;
@@ -801,21 +821,19 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
 
 _counter_update:
     // counter update
-    if (writtenSlot) {
-        if (entry.isCond) {
+    if (writtenSlot && entry.isCond) {
+        if (foundWay == numWays) { // miss
+            writtenSlot->alwaysTaken = thisBranchTaken;
+            writtenSlot->ctr = thisBranchTaken ? 0 : -1;
+        } else { // hit
             if (thisBranchTaken) {
-                if (isMispredict) {
-                    writtenSlot->alwaysTaken = true;
-                    writtenSlot->ctr = 0;
-                } else {
-                    if (writtenSlot->ctr < 1) writtenSlot->ctr++;
+                if (entry.ctr < 1) {
+                    writtenSlot->ctr++;
                 }
             } else {
-                if (isMispredict) {
-                    writtenSlot->alwaysTaken = false;
-                    writtenSlot->ctr = -1;
-                } else {
-                    if (writtenSlot->ctr > -2) writtenSlot->ctr--;
+                writtenSlot->alwaysTaken = false;
+                if (entry.ctr > -2) {
+                    writtenSlot->ctr--;
                 }
             }
         }
@@ -1042,31 +1060,28 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
     ADD_STAT(updateTimes, statistics::units::Count::get(), "Number of updates made"),
     ADD_STAT(updateMiss, statistics::units::Count::get(), "misses encountered on update"),
     ADD_STAT(updateHit, statistics::units::Count::get(), "hits encountered on update"),
-    ADD_STAT(updateMissTimes, statistics::units::Count::get(), "Number of update misses"),
-    ADD_STAT(updateFoundEmptyTimes, statistics::units::Count::get(),"Number of update where an empty entry was found"),
-    ADD_STAT(updateEvictTimes, statistics::units::Count::get(),"Number of update where an entry was evicted"),
-    ADD_STAT(updateHitTimes, statistics::units::Count::get(), "Number of update hits"),
-    ADD_STAT(updateHitVictimTimes, statistics::units::Count::get(),
-        "Number of update hits from victim cache"),
-    ADD_STAT(updateMultiHitTimes, statistics::units::Count::get(), "Number of update multi-hits"),
-    ADD_STAT(updateExisting, statistics::units::Count::get(), "existing entries updated"),
-    ADD_STAT(updateReplace, statistics::units::Count::get(), "entries replaced"),
-    ADD_STAT(updateReplaceValidOne, statistics::units::Count::get(),
-        "entries replaced with valid entry"),
-    ADD_STAT(updateInVC, statistics::units::Count::get(), "entries updated in victim cache"),
-    ADD_STAT(updateTotal, statistics::units::Count::get(), "total number of entries updated"),
-    ADD_STAT(updateFixTarget, statistics::units::Count::get(),
-        "the number of fix entries target when update"),
-    ADD_STAT(updateUsePagePointerTimes, statistics::units::Count::get(),
-        "Number of updates using page pointer"),
-    ADD_STAT(updateAllocatePagePointerTimes, statistics::units::Count::get(),
-        "Number of updates allocating new page pointer"),
-    ADD_STAT(updateNotUseButHasPagePointerTimes, statistics::units::Count::get(),
-        "Number of updates not using page pointer but having page pointer"),
-    ADD_STAT(updateNotUseAndNoPagePointerTimes, statistics::units::Count::get(),
-        "Number of updates not using page pointer and no page pointer"),
-    ADD_STAT(carryOverflowTimes, statistics::units::Count::get(),
-        "Number of times carry overflow occurred during updates"),
+    ADD_STAT(updateLookupMiss, statistics::units::Count::get(),
+        "update lookup misses in monitor BTB"),
+    ADD_STAT(updateLookupMissNoAllocate, statistics::units::Count::get(),
+        "update lookup misses that are not allocated"),
+    ADD_STAT(updateLookupHitShortSlot, statistics::units::Count::get(),
+        "update lookup hits on short slots"),
+    ADD_STAT(updateLookupHitLongSlot, statistics::units::Count::get(),
+        "update lookup hits on long slots"),
+    ADD_STAT(updateWriteInvalidWay, statistics::units::Count::get(),
+        "updates written into fully invalid way"),
+    ADD_STAT(updateWritePartialInvalidSlot, statistics::units::Count::get(),
+        "updates written into partial invalid slot"),
+    ADD_STAT(updateWriteReplaceSameType, statistics::units::Count::get(),
+        "updates replacing victim with same entry type"),
+    ADD_STAT(updateWriteFuseOnUnfusedWay, statistics::units::Count::get(),
+        "fused updates written on unfused way"),
+    ADD_STAT(updateWriteUnfusedOnFusedWay, statistics::units::Count::get(),
+        "unfused updates written on fused way"),
+    ADD_STAT(updateWriteFusedVictimFused, statistics::units::Count::get(),
+        "fused update chose fused victim way"),
+    ADD_STAT(updateWriteFusedVictimUnfused, statistics::units::Count::get(),
+        "fused update chose unfused victim way"),
     ADD_STAT(allBranchHits, statistics::units::Count::get(),
         "all types of branches committed that was predicted hit"),
     ADD_STAT(totalBranchHits, statistics::units::Count::get(), "Total number of branch hits in BTB"),
@@ -1115,18 +1130,6 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
         "indirect target mispredictions from cross-page entries"),
     ADD_STAT(indirectPredWrongNonCrossPage, statistics::units::Count::get(),
         "indirect target mispredictions from non-cross-page entries"),
-    ADD_STAT(indirectPredWrongCarryFit, statistics::units::Count::get(),
-        "indirect target mispredictions with carry Fit"),
-    ADD_STAT(indirectPredWrongCarryPlusOne, statistics::units::Count::get(),
-        "indirect target mispredictions with carry PlusOne"),
-    ADD_STAT(indirectPredWrongCarryMinusOne, statistics::units::Count::get(),
-        "indirect target mispredictions with carry MinusOne"),
-    ADD_STAT(indirectPredWrongCarryNone, statistics::units::Count::get(),
-        "indirect target mispredictions with carry None"),
-    ADD_STAT(indirectPredWrongUsePagePointer, statistics::units::Count::get(),
-        "indirect target mispredictions on entries using page pointer"),
-    ADD_STAT(indirectPredWrongNoPagePointer, statistics::units::Count::get(),
-        "indirect target mispredictions on entries not using page pointer"),
     ADD_STAT(callHits, statistics::units::Count::get(), "Number of call branch hits"),
     ADD_STAT(callMisses, statistics::units::Count::get(), "Number of call branch misses"),
     ADD_STAT(returnHits, statistics::units::Count::get(), "Number of return branch hits"),
