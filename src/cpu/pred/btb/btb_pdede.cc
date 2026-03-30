@@ -232,23 +232,49 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
 {
     auto monitorEntries = originEntries;
     std::vector<BTBEntry> btbEntries;
+    Addr endPc = (pc + predictWidth) & ~mask(floorLog2(predictWidth) - 1);
+
+    DPRINTF(BTBPDede,
+        "BTBPDede: processMonitorEntries startPC=%#lx endPC=%#lx alignedStart=%#lx\n",
+        pc, endPc, pc & ~(blockSize - 1));
 
     // collect all valid entries
     for (unsigned i = 0; i < numAlignBanks; ++i) {
         unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
         auto &bank = monitorEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
+        Addr monitorBTBIdx = getMonitorBTBIdx(alignedAddr);
+        Addr monitorBTBTag = getMonitorBTBTag(alignedAddr);
+
+        DPRINTF(BTBPDede,
+            "BTBPDede: inspect logicBank=%u phyBank=%u alignedAddr=%#lx idx=%#lx tag=%#lx\n",
+            i, phyBankIdx, alignedAddr, monitorBTBIdx, monitorBTBTag);
 
         for (unsigned way = 0; way < numWays; ++way) {
             MonitorEntry &entry = bank[way];
 
-            Addr monitorBTBIdx = getMonitorBTBIdx(alignedAddr);
-            Addr monitorBTBTag = getMonitorBTBTag(alignedAddr);
-
             auto checkValidEntry = [&](bool valid, Addr tag, Addr branchPc) -> bool {
-                if (!valid) return false;
-                if (branchPc < pc || branchPc >= (pc + predictWidth)) return false;
-                if (tag != monitorBTBTag) return false;
+                if (!valid) {
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: reject way=%u alignedAddr=%#lx branchPc=%#lx \
+                        reason=invalid\n",
+                        way, alignedAddr, branchPc);
+                    return false;
+                }
+                if (branchPc < pc || branchPc >= endPc) {
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: reject way=%u alignedAddr=%#lx branchPc=%#lx \
+                        reason=out_of_range start=%#lx end=%#lx\n",
+                        way, alignedAddr, branchPc, pc, endPc);
+                    return false;
+                }
+                if (tag != monitorBTBTag) {
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: reject way=%u alignedAddr=%#lx branchPc=%#lx \
+                        reason=tag_mismatch entryTag=%#lx expectTag=%#lx\n",
+                        way, alignedAddr, branchPc, tag, monitorBTBTag);
+                    return false;
+                }
                 return true;
             };
 
@@ -345,6 +371,14 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
         }
     );
 
+    DPRINTF(BTBPDede, "BTBPDede: final %zu entries for startPC %#lx\n", btbEntries.size(), pc);
+    for (const auto &e : btbEntries) {
+        DPRINTF(BTBPDede,
+            "BTBPDede: final entry pc=%#lx target=%#lx cond=%d indirect=%d call=%d return=%d alwaysTaken=%d ctr=%d\n",
+            e.pc, e.target, e.isCond, e.isIndirect, e.isCall, e.isReturn,
+            e.alwaysTaken, e.ctr);
+    }
+
     if (btbEntries.size()) stats.predHitTimes++;
     else stats.predMissTimes++;
 
@@ -436,6 +470,19 @@ BTBPDede::prepareUpdateEntries(const FetchTarget &stream)
 {
     auto all_entries = stream.updateBTBEntries;
 
+    DPRINTF(BTBPDede,
+        "BTBPDede: prepareUpdateEntries startPC=%#lx controlPC=%#lx \
+        exeTaken=%d updateIsOldEntry=%d existing=%zu\n",
+        stream.startPC, stream.getControlPC(), stream.exeTaken,
+        stream.updateIsOldEntry, all_entries.size());
+    for (const auto &e : all_entries) {
+        DPRINTF(BTBPDede,
+            "BTBPDede: existing update entry pc=%#lx target=%#lx resolved=%d \
+            cond=%d indirect=%d alwaysTaken=%d ctr=%d\n",
+            e.pc, e.target, e.resolved, e.isCond, e.isIndirect,
+            e.alwaysTaken, e.ctr);
+    }
+
     if (!stream.updateIsOldEntry) {
         BTBEntry potential_new_entry = stream.updateNewBTBEntry;
         bool new_entry_taken =
@@ -444,6 +491,12 @@ BTBPDede::prepareUpdateEntries(const FetchTarget &stream)
             potential_new_entry.alwaysTaken = false;
         }
         all_entries.push_back(potential_new_entry);
+        DPRINTF(BTBPDede,
+            "BTBPDede: appended new entry pc=%#lx target=%#lx taken=%d \
+            cond=%d indirect=%d alwaysTaken=%d ctr=%d\n",
+            potential_new_entry.pc, potential_new_entry.target, new_entry_taken,
+            potential_new_entry.isCond, potential_new_entry.isIndirect,
+            potential_new_entry.alwaysTaken, potential_new_entry.ctr);
     }
 
     if (getResolvedUpdate()) {
@@ -452,6 +505,15 @@ BTBPDede::prepareUpdateEntries(const FetchTarget &stream)
             all_entries.end(),
             [](const BTBEntry &e) { return !e.resolved; });
         all_entries.erase(remove_it, all_entries.end());
+    }
+
+    DPRINTF(BTBPDede, "BTBPDede: final update entry count=%zu\n", all_entries.size());
+    for (const auto &e : all_entries) {
+        DPRINTF(BTBPDede,
+            "BTBPDede: final update entry pc=%#lx target=%#lx resolved=%d \
+            cond=%d indirect=%d alwaysTaken=%d ctr=%d\n",
+            e.pc, e.target, e.resolved, e.isCond, e.isIndirect,
+            e.alwaysTaken, e.ctr);
     }
 
     return all_entries;
@@ -470,8 +532,14 @@ BTBPDede::checkPredictionHit(const FetchTarget &stream,
     }
 
     if (!pred_branch_hit && stream.exeTaken) {
+        DPRINTF(BTBPDede,
+            "BTBPDede: update miss exePC=%#lx controlPC=%#lx exeTaken=%d\n",
+            stream.exeBranchInfo.pc, stream.getControlPC(), stream.exeTaken);
         stats.updateMiss++;
     } else {
+        DPRINTF(BTBPDede,
+            "BTBPDede: update hit exePC=%#lx controlPC=%#lx exeTaken=%d\n",
+            stream.exeBranchInfo.pc, stream.getControlPC(), stream.exeTaken);
         stats.updateHit++;
     }
 }
@@ -531,6 +599,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     Addr vpnLower = getVpnLower(target, longSlotTargetBits);
     Addr vpnUpper = getVpnUpper(target, longSlotTargetBits);
 
+    DPRINTF(BTBPDede,
+        "BTBPDede: updateResolvedEntry pc=%#lx target=%#lx thisTaken=%d \
+        mispredict=%d updateIsFused=%d bank=%u idx=%u tag=%#lx pageIdx=%u vpnLower=%#lx vpnUpper=%#lx\n",
+        pc, target, thisBranchTaken, isMispredict, updateIsFused, bankIdx,
+        monitorBTBIdx, monitorBTBTag, pageBTBIdx, vpnLower, vpnUpper);
+
     auto &toUpdateSet = monitorBTB[bankIdx][monitorBTBIdx];
     auto &toUpdateRrpvSet = monitorRrpv[bankIdx][monitorBTBIdx];
 
@@ -543,7 +617,7 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         if (!entry.fused) {
             for (unsigned slot = 0; slot < shortSlots; ++slot) {
                 auto shortSlot = entry.shortSlots[slot];
-                if (shortSlot.bi.pc == pc) {
+                if (shortSlot.valid && shortSlot.bi.pc == pc) {
                     foundWay = way;
                     foundSlot = slot;
                     break;
@@ -551,7 +625,7 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
             }
         } else {
             auto longSlot = entry.longSlot;
-            if (longSlot.bi.pc == pc) {
+            if (entry.shortSlots[0].valid && longSlot.bi.pc == pc) {
                 foundWay = way;
                 break;
             }
@@ -587,6 +661,10 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     } else {
         stats.updateLookupHitLongSlot++;
     }
+
+    DPRINTF(BTBPDede,
+        "BTBPDede: update lookup result pc=%#lx foundWay=%u foundSlot=%u foundPageWay=%u foundRegionWay=%u\n",
+        pc, foundWay, foundSlot, foundPageWay, foundRegionWay);
 
     auto writeFusedEntry = [&](MonitorEntry &toWrite) {
         toWrite.fused = true;
@@ -664,12 +742,39 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     if (foundWay == numWays) { // miss
         // check not taken conditional branch
         if (entry.isCond && !thisBranchTaken) {
+            DPRINTF(BTBPDede,
+                "BTBPDede: skip allocate not-taken conditional pc=%#lx\n", pc);
             return;
+        }
+        // check paritially invalid slot
+        for (unsigned way = 0; way < numWays; ++way) {
+            if (updateIsFused) continue; // fused entry cannot use partially invalid entry
+            if (toUpdateSet[way].fused) continue;
+            for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                if (toUpdateSet[way].shortSlots[slot].valid) continue;
+                if (toUpdateSet[way].tag != monitorBTBTag) continue;
+
+                stats.updateWritePartialInvalidSlot++;
+                DPRINTF(BTBPDede,
+                    "BTBPDede: allocate partial-invalid slot pc=%#lx way=%u slot=%u fused=%d\n",
+                    pc, way, slot, updateIsFused);
+
+                toUpdateSet[way].shortSlots[slot].valid = true;
+                toUpdateSet[way].shortSlots[slot].bi = BranchInfo(entry);
+                toUpdateSet[way].shortSlots[slot].bi.resolved = false;
+
+                toUpdateRrpvSet[way * shortSlots + slot] = monitorMaxRrpv - 1;
+                writtenSlot = &toUpdateSet[way].shortSlots[slot];
+                goto _counter_update;
+            }
         }
         // check invalid entry
         for (unsigned way = 0; way < numWays; ++way) {
             if (!toUpdateSet[way].shortSlots[0].valid && !toUpdateSet[way].shortSlots[1].valid) {
                 stats.updateWriteInvalidWay++;
+                DPRINTF(BTBPDede,
+                    "BTBPDede: allocate invalid way pc=%#lx way=%u fused=%d\n",
+                    pc, way, updateIsFused);
                 writtenSlot = &toUpdateSet[way].shortSlots[0];
                 if (updateIsFused) {
                     writeFusedEntry(toUpdateSet[way]);
@@ -686,28 +791,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 goto _counter_update;
             }
         }
-        // check paritially invalid slot
-        for (unsigned way = 0; way < numWays; ++way) {
-            if (updateIsFused) continue; // fused entry cannot use partially invalid entry
-            if (toUpdateSet[way].fused) continue;
-            for (unsigned slot = 0; slot < shortSlots; ++slot) {
-                if (toUpdateSet[way].shortSlots[slot].valid) continue;
-                if (toUpdateSet[way].tag != monitorBTBTag) continue;
-
-                stats.updateWritePartialInvalidSlot++;
-
-                toUpdateSet[way].shortSlots[slot].valid = true;
-                toUpdateSet[way].shortSlots[slot].bi = BranchInfo(entry);
-                toUpdateSet[way].shortSlots[slot].bi.resolved = false;
-
-                toUpdateRrpvSet[way * shortSlots + slot] = monitorMaxRrpv - 1;
-                writtenSlot = &toUpdateSet[way].shortSlots[slot];
-                goto _counter_update;
-            }
-        }
         // if no invalid entry, need to replace the entry with max RRPV
         if (updateIsFused == toUpdateSet[maxRrpvWay].fused) {
             stats.updateWriteReplaceSameType++;
+            DPRINTF(BTBPDede,
+                "BTBPDede: replace same-type pc=%#lx victimWay=%u fused=%d maxRrpvDistance=%u buddy=%u\n",
+                pc, maxRrpvWay, updateIsFused, maxRrpvDistance, maxRrpvDistanceBuddy);
             if (updateIsFused) { // write fused entry with fused entry
                 writeFusedEntry(toUpdateSet[maxRrpvWay]);
                 writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
@@ -724,16 +813,19 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                     slot.bi = BranchInfo(entry);
                     slot.bi.resolved = false;
                 };
+                auto invalidateShortSlot = [&](MonitorShortSlot &slot) {
+                    slot = MonitorShortSlot();
+                };
                 if (maxRrpvDistance % shortSlots == 0) {
                     writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
                     if (retagged) {
-                        toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
+                        invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
                     }
                     writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
                 } else {
                     writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
                     if (retagged) {
-                        toUpdateSet[maxRrpvWay].shortSlots[0].valid = false;
+                        invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
                     }
                     writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
                 }
@@ -744,6 +836,9 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
             }
         } else if (updateIsFused && !toUpdateSet[maxRrpvWay].fused) { // write fused entry with unfused entry
             stats.updateWriteFuseOnUnfusedWay++;
+            DPRINTF(BTBPDede,
+                "BTBPDede: convert unfused->fused pc=%#lx victimWay=%u buddyRrpv=%u\n",
+                pc, maxRrpvWay, toUpdateRrpvSet[maxRrpvDistanceBuddy]);
             unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
             if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
                 writeFusedEntry(toUpdateSet[maxRrpvWay]);
@@ -791,12 +886,15 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
             }
         } else { // write unfused entry with fused entry
             stats.updateWriteUnfusedOnFusedWay++;
+            DPRINTF(BTBPDede,
+                "BTBPDede: convert fused->unfused pc=%#lx victimWay=%u\n",
+                pc, maxRrpvWay);
             toUpdateSet[maxRrpvWay].fused = false;
             toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
             toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
             toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
             toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
-            toUpdateSet[maxRrpvWay].shortSlots[1].valid = false;
+            toUpdateSet[maxRrpvWay].shortSlots[1] = MonitorShortSlot();
             writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
 
             std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
@@ -822,21 +920,27 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
 _counter_update:
     // counter update
     if (writtenSlot && entry.isCond) {
+        int oldCtr = writtenSlot->ctr;
+        bool oldAlwaysTaken = writtenSlot->alwaysTaken;
         if (foundWay == numWays) { // miss
             writtenSlot->alwaysTaken = thisBranchTaken;
             writtenSlot->ctr = thisBranchTaken ? 0 : -1;
         } else { // hit
             if (thisBranchTaken) {
-                if (entry.ctr < 1) {
+                if (writtenSlot->ctr < 1) {
                     writtenSlot->ctr++;
                 }
             } else {
                 writtenSlot->alwaysTaken = false;
-                if (entry.ctr > -2) {
+                if (writtenSlot->ctr > -2) {
                     writtenSlot->ctr--;
                 }
             }
         }
+        DPRINTF(BTBPDede,
+            "BTBPDede: cond state update pc=%#lx taken=%d alwaysTaken %d->%d ctr %d->%d\n",
+            pc, thisBranchTaken, oldAlwaysTaken, writtenSlot->alwaysTaken,
+            oldCtr, writtenSlot->ctr);
     }
 }
 
