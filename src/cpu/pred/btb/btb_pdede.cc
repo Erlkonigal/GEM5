@@ -237,6 +237,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
     DPRINTF(BTBPDede,
         "BTBPDede: processMonitorEntries startPC=%#lx endPC=%#lx alignedStart=%#lx\n",
         pc, endPc, pc & ~(blockSize - 1));
+    dumpLookupState(pc);
 
     // collect all valid entries
     for (unsigned i = 0; i < numAlignBanks; ++i) {
@@ -585,6 +586,10 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     bool isMispredict = stream.squashType == SQUASH_CTRL && stream.squashPC == pc;
     bool thisBranchTaken = stream.exeTaken && stream.exeBranchInfo.pc == pc;
 
+    if (entry.isIndirect && thisBranchTaken) {
+        target = stream.exeBranchInfo.target;
+    }
+
     unsigned dist = distance(pc, target);
 
     bool canUseShortSlot = dist <= (shortSlotTargetBits + instShiftAmt);
@@ -604,6 +609,7 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         mispredict=%d updateIsFused=%d bank=%u idx=%u tag=%#lx pageIdx=%u vpnLower=%#lx vpnUpper=%#lx\n",
         pc, target, thisBranchTaken, isMispredict, updateIsFused, bankIdx,
         monitorBTBIdx, monitorBTBTag, pageBTBIdx, vpnLower, vpnUpper);
+    dumpUpdateState(bankIdx, monitorBTBIdx, pageBTBIdx, vpnUpper);
 
     auto &toUpdateSet = monitorBTB[bankIdx][monitorBTBIdx];
     auto &toUpdateRrpvSet = monitorRrpv[bankIdx][monitorBTBIdx];
@@ -667,10 +673,13 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         pc, foundWay, foundSlot, foundPageWay, foundRegionWay);
 
     auto writeFusedEntry = [&](MonitorEntry &toWrite) {
+        auto updatedEntry = entry;
+        updatedEntry.target = target;
+
         toWrite.fused = true;
         toWrite.tag = monitorBTBTag;
         toWrite.shortSlots[0].valid = true;
-        toWrite.longSlot.bi = BranchInfo(entry);
+        toWrite.longSlot.bi = BranchInfo(updatedEntry);
         toWrite.longSlot.bi.resolved = false;
 
         bool crossPage = isCrossPage(pc, target);
@@ -942,6 +951,8 @@ _counter_update:
             pc, thisBranchTaken, oldAlwaysTaken, writtenSlot->alwaysTaken,
             oldCtr, writtenSlot->ctr);
     }
+
+    dumpUpdateState(bankIdx, monitorBTBIdx, pageBTBIdx, vpnUpper);
 }
 
 void BTBPDede::update(const FetchTarget& stream) {
@@ -975,11 +986,78 @@ void BTBPDede::dumpBTBEntries(const std::vector<BTBEntry>& es) {
 }
 
 void BTBPDede::printMonitorEntry(const MonitorEntry& e) {
-
+    DPRINTF(BTBPDede, "MonitorEntry: fused=%d tag=%#lx\n", e.fused, e.tag);
+    for (unsigned slot = 0; slot < shortSlots; ++slot) {
+        const auto &shortSlot = e.shortSlots[slot];
+        DPRINTF(BTBPDede,
+            "  short[%u]: valid=%d alwaysTaken=%d ctr=%d pc=%#lx target=%#lx \
+            size=%u cond=%d direct=%d indirect=%d call=%d return=%d resolved=%d\n",
+            slot, shortSlot.valid, shortSlot.alwaysTaken, shortSlot.ctr,
+            shortSlot.bi.pc, shortSlot.bi.target, shortSlot.bi.size,
+            shortSlot.bi.isCond, shortSlot.bi.isDirect, shortSlot.bi.isIndirect,
+            shortSlot.bi.isCall, shortSlot.bi.isReturn, shortSlot.bi.resolved);
+    }
+    DPRINTF(BTBPDede,
+        "  long: crossPage=%d overflow=%d underflow=%d index=%#lx way=%#lx pc=%#lx target=%#lx \
+        size=%u cond=%d direct=%d indirect=%d call=%d return=%d resolved=%d\n",
+        e.longSlot.isCrossPage, e.longSlot.isOverflow, e.longSlot.isUnderflow,
+        e.longSlot.index, e.longSlot.way, e.longSlot.bi.pc, e.longSlot.bi.target,
+        e.longSlot.bi.size, e.longSlot.bi.isCond, e.longSlot.bi.isDirect,
+        e.longSlot.bi.isIndirect, e.longSlot.bi.isCall, e.longSlot.bi.isReturn,
+        e.longSlot.bi.resolved);
 }
 
 void BTBPDede::printPageEntry(const PageEntry& e) {
+    DPRINTF(BTBPDede, "PageEntry: valid=%d vpnLower=%#lx regionWay=%#lx\n",
+        e.valid, e.vpnLower, e.way);
+}
 
+void BTBPDede::printRegionEntry(const RegionEntry& e) {
+    DPRINTF(BTBPDede, "RegionEntry: valid=%d vpnUpper=%#lx\n",
+        e.valid, e.vpnUpper);
+}
+
+void BTBPDede::dumpMonitorSetState(unsigned phyBankIdx, Addr alignedAddr, Addr monitorBTBIdx) {
+    DPRINTF(BTBPDede,
+        "BTBPDede: dump monitor set phyBank=%u alignedAddr=%#lx idx=%#lx\n",
+        phyBankIdx, alignedAddr, monitorBTBIdx);
+    const auto &set = monitorBTB[phyBankIdx][monitorBTBIdx];
+    const auto &rrpv = monitorRrpv[phyBankIdx][monitorBTBIdx];
+    for (unsigned way = 0; way < numWays; ++way) {
+        DPRINTF(BTBPDede,
+            "BTBPDede:   way=%u rrpv0=%u rrpv1=%u\n",
+            way, rrpv[way * shortSlots], rrpv[way * shortSlots + 1]);
+        printMonitorEntry(set[way]);
+    }
+}
+
+void BTBPDede::dumpLookupState(Addr pc) {
+    Addr alignedStartAddr = pc & ~(blockSize - 1);
+    DPRINTF(BTBPDede, "BTBPDede: ===== full lookup state for startPC %#lx =====\n", pc);
+    for (unsigned i = 0; i < numAlignBanks; ++i) {
+        unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
+        Addr alignedAddr = alignedStartAddr + blockSize * i;
+        Addr idx = getMonitorBTBIdx(alignedAddr);
+        dumpMonitorSetState(phyBankIdx, alignedAddr, idx);
+    }
+}
+
+void BTBPDede::dumpUpdateState(unsigned bankIdx, unsigned monitorBTBIdx,
+                               unsigned pageBTBIdx, Addr vpnUpper) {
+    DPRINTF(BTBPDede,
+        "BTBPDede: ===== full update state bank=%u idx=%u pageIdx=%u vpnUpper=%#lx =====\n",
+        bankIdx, monitorBTBIdx, pageBTBIdx, vpnUpper);
+    dumpMonitorSetState(bankIdx, 0, monitorBTBIdx);
+    DPRINTF(BTBPDede, "BTBPDede: dump page set idx=%u\n", pageBTBIdx);
+    for (unsigned way = 0; way < numPageWays; ++way) {
+        DPRINTF(BTBPDede, "BTBPDede:   page way=%u rrpv=%u\n", way, pageRrpv[pageBTBIdx][way]);
+        printPageEntry(pageBTB[pageBTBIdx][way]);
+    }
+    DPRINTF(BTBPDede, "BTBPDede: dump region set vpnUpper=%#lx\n", vpnUpper);
+    for (unsigned way = 0; way < numRegionWays; ++way) {
+        DPRINTF(BTBPDede, "BTBPDede:   region way=%u rrpv=%u\n", way, regionRrpv[0][way]);
+        printRegionEntry(regionBTB[0][way]);
+    }
 }
 
 void BTBPDede::getAndSetNewBTBEntry(FetchTarget &stream)

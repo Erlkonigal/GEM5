@@ -156,6 +156,10 @@ private:
     void printMonitorEntry(const MonitorEntry& e);
     void printPageEntry(const PageEntry& e);
     void printRegionEntry(const RegionEntry& e);
+    void dumpMonitorSetState(unsigned phyBankIdx, Addr alignedAddr, Addr monitorBTBIdx);
+    void dumpLookupState(Addr pc);
+    void dumpUpdateState(unsigned bankIdx, unsigned monitorBTBIdx,
+                         unsigned pageBTBIdx, Addr vpnUpper);
 
     typedef statistics::Scalar Scalar;
     struct PDedeStats : public statistics::Group
