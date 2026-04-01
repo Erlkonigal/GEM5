@@ -1,5 +1,6 @@
 #include <algorithm>
 
+#include "base/random.hh"
 #include "btb_pdede.hh"
 #include "cpu/o3/dyn_inst.hh"
 
@@ -189,8 +190,7 @@ std::vector<BTBPDede::MonitorSet> BTBPDede::getMonitorEntries(Addr pc)
         unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
         Addr alignedAddr = alignedStartAddr + blockSize * i;
         Addr idx = getMonitorBTBIdx(alignedAddr);
-        MonitorSet monitorSet = monitorBTB[phyBankIdx][idx];
-        res[phyBankIdx] = monitorSet;
+        res[phyBankIdx] = monitorBTB[phyBankIdx][idx];
     }
 
     return res;
@@ -230,7 +230,6 @@ Addr BTBPDede::getVpnUpper(Addr target, unsigned targetBits) {
 
 std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector<MonitorSet> &originEntries)
 {
-    auto monitorEntries = originEntries;
     std::vector<BTBEntry> btbEntries;
     Addr endPc = (pc + predictWidth) & ~mask(floorLog2(predictWidth) - 1);
 
@@ -242,7 +241,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
     // collect all valid entries
     for (unsigned i = 0; i < numAlignBanks; ++i) {
         unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
-        auto &bank = monitorEntries[phyBankIdx];
+        const auto &bank = originEntries[phyBankIdx];
         Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
         Addr monitorBTBIdx = getMonitorBTBIdx(alignedAddr);
         Addr monitorBTBTag = getMonitorBTBTag(alignedAddr);
@@ -252,7 +251,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             i, phyBankIdx, alignedAddr, monitorBTBIdx, monitorBTBTag);
 
         for (unsigned way = 0; way < numWays; ++way) {
-            MonitorEntry &entry = bank[way];
+            const MonitorEntry &entry = bank[way];
 
             auto checkValidEntry = [&](bool valid, Addr tag, Addr branchPc) -> bool {
                 if (!valid) {
@@ -385,11 +384,8 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
 
     stats.predHitEntries += btbEntries.size();
 
-    BTBPDedeMeta newMeta;
-    newMeta.rawMonitorSets = originEntries;
-    newMeta.btbEntries = btbEntries;
-
-    meta = std::make_shared<BTBPDedeMeta>(newMeta);
+    meta = std::make_shared<BTBPDedeMeta>();
+    meta->btbEntries = btbEntries;
 
     return btbEntries;
 }
@@ -742,11 +738,24 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     // entry update
     MonitorShortSlot *writtenSlot = nullptr;
 
-    auto maxRrpvIt = std::max_element(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end());
-    unsigned maxRrpvDistance = std::distance(toUpdateRrpvSet.begin(), maxRrpvIt);
+    auto chooseMaxRrpvDistance = [&]() {
+        auto maxRrpvIt = std::max_element(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end());
+        unsigned bestDistance = std::distance(toUpdateRrpvSet.begin(), maxRrpvIt);
+        unsigned bestRrpv = *maxRrpvIt;
+        bool allEqual = std::all_of(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(),
+            [&](unsigned rrpv) { return rrpv == bestRrpv; });
+        if (allEqual) {
+            bestDistance = random_mt.random<unsigned>(0, toUpdateRrpvSet.size() - 1);
+        }
+        return bestDistance;
+    };
+    auto clearLongSlot = [](MonitorEntry &entry) {
+        entry.longSlot = MonitorLongSlot();
+    };
+    unsigned maxRrpvDistance = chooseMaxRrpvDistance();
     unsigned maxRrpvDistanceBuddy = maxRrpvDistance ^ 1;
     unsigned maxRrpvWay = maxRrpvDistance / shortSlots;
-    unsigned maxRrpv = *maxRrpvIt;
+    unsigned maxRrpv = toUpdateRrpvSet[maxRrpvDistance];
 
     if (foundWay == numWays) { // miss
         // check not taken conditional branch
@@ -792,6 +801,7 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 } else {
                     toUpdateSet[way].fused = false;
                     toUpdateSet[way].tag = monitorBTBTag;
+                    clearLongSlot(toUpdateSet[way]);
                     toUpdateSet[way].shortSlots[0].valid = true;
                     toUpdateSet[way].shortSlots[0].bi = BranchInfo(entry);
                     toUpdateSet[way].shortSlots[0].bi.resolved = false;
@@ -817,6 +827,7 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
                 toUpdateSet[maxRrpvWay].fused = false;
                 toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
+                clearLongSlot(toUpdateSet[maxRrpvWay]);
                 auto writeShortSlot = [&](MonitorShortSlot &slot) {
                     slot.valid = true;
                     slot.bi = BranchInfo(entry);
@@ -843,73 +854,146 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                     [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
                 toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
             }
-        } else if (updateIsFused && !toUpdateSet[maxRrpvWay].fused) { // write fused entry with unfused entry
-            stats.updateWriteFuseOnUnfusedWay++;
-            DPRINTF(BTBPDede,
-                "BTBPDede: convert unfused->fused pc=%#lx victimWay=%u buddyRrpv=%u\n",
-                pc, maxRrpvWay, toUpdateRrpvSet[maxRrpvDistanceBuddy]);
-            unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
-            if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
-                writeFusedEntry(toUpdateSet[maxRrpvWay]);
-                writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                    [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
-            } else { // recently used
-                // check all fused entries to find the most rrpv one to replace
-                unsigned fusedVictimWay = numWays;
-                unsigned fusedVictimRrpv = 0;
-                for (unsigned way = 0; way < numWays; ++way) {
-                    if (!toUpdateSet[way].fused) continue;
-                    if (toUpdateRrpvSet[way * shortSlots] > fusedVictimRrpv) {
-                        fusedVictimWay = way;
-                        fusedVictimRrpv = toUpdateRrpvSet[way * shortSlots];
-                    }
-                }
-                // if has fused entry with higher RRPV, replace it;
-                if (fusedVictimWay != numWays) {
-                    stats.updateWriteFusedVictimFused++;
-                    writeFusedEntry(toUpdateSet[fusedVictimWay]);
-                    writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
-                    toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
-                } else { // no fused entry, replace unfused entry which has the least sum of rrpv
-                    stats.updateWriteFusedVictimUnfused++;
-                    unsigned unfusedVictimWay = numWays;
-                    unsigned unfusedVictimRrpvSum = 0;
+        } else {
+            if (updateIsFused) { // write fused entry with unfused entry
+                stats.updateWriteFuseOnUnfusedWay++;
+                DPRINTF(BTBPDede,
+                    "BTBPDede: convert unfused->fused pc=%#lx victimWay=%u buddyRrpv=%u\n",
+                    pc, maxRrpvWay, toUpdateRrpvSet[maxRrpvDistanceBuddy]);
+                unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
+                if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
+                    writeFusedEntry(toUpdateSet[maxRrpvWay]);
+                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
+                } else { // recently used
+                    // check all fused entries to find the most rrpv one to replace
+                    unsigned fusedVictimWay = numWays;
+                    unsigned fusedVictimRrpv = 0;
+                    bool foundFusedVictim = false;
                     for (unsigned way = 0; way < numWays; ++way) {
-                        if (toUpdateSet[way].fused) continue;
-                        unsigned rrpvSum = toUpdateRrpvSet[way * shortSlots] + \
-                            toUpdateRrpvSet[way * shortSlots + 1];
-                        if (rrpvSum > unfusedVictimRrpvSum) {
-                            unfusedVictimWay = way;
-                            unfusedVictimRrpvSum = rrpvSum;
+                        if (!toUpdateSet[way].fused) continue;
+                        if (!foundFusedVictim ||
+                            toUpdateRrpvSet[way * shortSlots] > fusedVictimRrpv) {
+                            fusedVictimWay = way;
+                            fusedVictimRrpv = toUpdateRrpvSet[way * shortSlots];
+                            foundFusedVictim = true;
                         }
                     }
-                    writeFusedEntry(toUpdateSet[unfusedVictimWay]);
-                    writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
-                    toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                    // if has fused entry with higher RRPV, replace it;
+                    if (foundFusedVictim) {
+                        stats.updateWriteFusedVictimFused++;
+                        writeFusedEntry(toUpdateSet[fusedVictimWay]);
+                        writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
+                        toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
+                        toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                    } else { // no fused entry, replace unfused entry which has the least sum of rrpv
+                        stats.updateWriteFusedVictimUnfused++;
+                        unsigned unfusedVictimWay = numWays;
+                        unsigned unfusedVictimRrpvSum = 0;
+                        bool foundUnfusedVictim = false;
+                        for (unsigned way = 0; way < numWays; ++way) {
+                            if (toUpdateSet[way].fused) continue;
+                            unsigned rrpvSum = toUpdateRrpvSet[way * shortSlots] + \
+                                toUpdateRrpvSet[way * shortSlots + 1];
+                            if (!foundUnfusedVictim ||
+                                rrpvSum > unfusedVictimRrpvSum) {
+                                unfusedVictimWay = way;
+                                unfusedVictimRrpvSum = rrpvSum;
+                                foundUnfusedVictim = true;
+                            }
+                        }
+                        if (!foundUnfusedVictim) {
+                            DPRINTF(BTBPDede,
+                                "BTBPDede: all ways fused with low RRPV, fallback replace victimWay=%u pc=%#lx\n",
+                                maxRrpvWay, pc);
+                            unfusedVictimWay = maxRrpvWay;
+                        }
+                        writeFusedEntry(toUpdateSet[unfusedVictimWay]);
+                        writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
+                        toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
+                        toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
+                    }
+                }
+            } else { // write unfused entry with fused entry
+                unsigned unfusedVictimDistance = toUpdateRrpvSet.size();
+                unsigned unfusedVictimRrpv = 0;
+                bool foundUnfusedVictim = false;
+                for (unsigned distance = 0; distance < toUpdateRrpvSet.size(); ++distance) {
+                    unsigned way = distance / shortSlots;
+                    if (toUpdateSet[way].fused) {
+                        continue;
+                    }
+                    unsigned rrpv = toUpdateRrpvSet[distance];
+                    if (!foundUnfusedVictim || rrpv > unfusedVictimRrpv) {
+                        unfusedVictimDistance = distance;
+                        unfusedVictimRrpv = rrpv;
+                        foundUnfusedVictim = true;
+                    }
+                }
+                if (foundUnfusedVictim) {
+                    maxRrpvDistance = unfusedVictimDistance;
+                    maxRrpvDistanceBuddy = maxRrpvDistance ^ 1;
+                    maxRrpvWay = maxRrpvDistance / shortSlots;
+                    maxRrpv = toUpdateRrpvSet[maxRrpvDistance];
+                }
+
+                if (toUpdateSet[maxRrpvWay].fused) {
+                    stats.updateWriteUnfusedOnFusedWay++;
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: convert fused->unfused pc=%#lx victimWay=%u\n",
+                        pc, maxRrpvWay);
+                    toUpdateSet[maxRrpvWay].fused = false;
+                    toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
+                    clearLongSlot(toUpdateSet[maxRrpvWay]);
+                    toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
+                    toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
+                    toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
+                    toUpdateSet[maxRrpvWay].shortSlots[1] = MonitorShortSlot();
+                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+
+                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
+                } else {
+                    stats.updateWriteReplaceSameType++;
+                    DPRINTF(BTBPDede,
+                        "BTBPDede: replace same-type pc=%#lx victimWay=%u fused=%d maxRrpvDistance=%u buddy=%u\n",
+                        pc, maxRrpvWay, updateIsFused, maxRrpvDistance, maxRrpvDistanceBuddy);
+                    bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
+                    toUpdateSet[maxRrpvWay].fused = false;
+                    toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
+                    clearLongSlot(toUpdateSet[maxRrpvWay]);
+                    auto writeShortSlot = [&](MonitorShortSlot &slot) {
+                        slot.valid = true;
+                        slot.bi = BranchInfo(entry);
+                        slot.bi.resolved = false;
+                    };
+                    auto invalidateShortSlot = [&](MonitorShortSlot &slot) {
+                        slot = MonitorShortSlot();
+                    };
+                    if (maxRrpvDistance % shortSlots == 0) {
+                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
+                        if (retagged) {
+                            invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
+                        }
+                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
+                    } else {
+                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
+                        if (retagged) {
+                            invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
+                        }
+                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
+                    }
+
+                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
+                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
+                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
                 }
             }
-        } else { // write unfused entry with fused entry
-            stats.updateWriteUnfusedOnFusedWay++;
-            DPRINTF(BTBPDede,
-                "BTBPDede: convert fused->unfused pc=%#lx victimWay=%u\n",
-                pc, maxRrpvWay);
-            toUpdateSet[maxRrpvWay].fused = false;
-            toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
-            toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
-            toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
-            toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
-            toUpdateSet[maxRrpvWay].shortSlots[1] = MonitorShortSlot();
-            writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-
-            std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-            toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-            toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
         }
     } else { // hit
         if (foundSlot != shortSlots) { // hit short slot

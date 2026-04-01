@@ -103,7 +103,6 @@ private:
 
     struct BTBPDedeMeta
     {
-        std::vector<MonitorSet> rawMonitorSets;
         std::vector<BTBEntry> btbEntries;
     };
 
