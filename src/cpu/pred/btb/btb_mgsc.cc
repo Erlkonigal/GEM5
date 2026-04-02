@@ -438,9 +438,16 @@ BTBMGSC::generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC
     // Final prediction, total_sum >= 0 means taken if use_sc_pred
     bool taken = use_sc_pred ? (total_sum >= 0) : tage_info.tage_pred_taken;
 
-    // DPRINTF(MGSC, "global tag_index: %d, global_percsum: %d, total_sum: %d\n", gIndex[0], g_percsum, total_sum);
-    // DPRINTF(MGSC, "local tag_index: %d, local_percsum: %d, total_sum: %d\n", lIndex[0], l_percsum, total_sum);
-    // DPRINTF(MGSC, "path tag_index: %d, path_percsum: %d, total_sum: %d\n", pIndex[0], p_percsum, total_sum);
+    DPRINTF(MGSC,
+        "sc detail pc=%#lx startPC=%#lx tage_taken=%d conf[h/m/l]=%d/%d/%d \
+        use_sc=%d total_sum=%d total_thres=%d bw=%d l=%d i=%d g=%d p=%d bias=%d \
+        bw_scaled=%d l_scaled=%d i_scaled=%d g_scaled=%d p_scaled=%d bias_scaled=%d\n",
+        btb_entry.pc, startPC, tage_info.tage_pred_taken,
+        tage_info.tage_pred_conf_high, tage_info.tage_pred_conf_mid,
+        tage_info.tage_pred_conf_low, use_sc_pred, total_sum, total_thres,
+        bw_percsum, l_percsum, i_percsum, g_percsum, p_percsum, bias_percsum,
+        bw_scaled_percsum, l_scaled_percsum, i_scaled_percsum,
+        g_scaled_percsum, p_scaled_percsum, bias_scaled_percsum);
 
     // Calculate weight scale differences
     bool bw_weight_scale_diff = calculateWeightScaleDiff(total_sum, bw_scaled_percsum, bw_percsum);
@@ -777,6 +784,15 @@ BTBMGSC::updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const M
     auto sc_pred_taken = total_sum >= 0;
     auto tage_pred_taken = pred.taken_before_sc;  // tage predictions
 
+    DPRINTF(MGSC,
+        "updateSinglePredictor pc=%#lx startPC=%#lx actual=%d tage_taken=%d \
+        sc_taken=%d use_sc=%d total_sum=%d total_thres=%d conf[h/m/l]=%d/%d/%d bw=%d l=%d i=%d g=%d p=%d bias=%d\n",
+        entry.pc, stream.startPC, actual_taken, tage_pred_taken, sc_pred_taken,
+        use_mgsc, total_sum, total_thres, pred.tage_conf_high,
+        pred.tage_conf_mid, pred.tage_conf_low, pred.bw_percsum,
+        pred.l_percsum, pred.i_percsum, pred.g_percsum, pred.p_percsum,
+        pred.bias_percsum);
+
     recordPredictionStats(pred, actual_taken, sc_pred_taken, tage_pred_taken);
 
 #ifndef UNIT_TEST
@@ -798,6 +814,10 @@ BTBMGSC::updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const M
         // get weight table index from startPC
         Addr weightTableIdx = getPcIndex(stream.startPC, weightTableIdxWidth);
         bool threshold_inc = (sc_pred_taken != actual_taken);
+        DPRINTF(MGSC,
+            "updateSinglePredictor train pc=%#lx threshold_inc=%d weightTableIdx=%#lx \
+            abs(total_sum)=%d half_thres=%d\n",
+            entry.pc, threshold_inc, weightTableIdx, abs(total_sum), total_thres / 2);
         if (threshold_inc) {
             mgscStats.pcThresholdInc++;
             mgscStats.globalThresholdInc++;

@@ -77,12 +77,70 @@ BTBPDede::BTBPDede(const Params& p):
         numEntries, numWays, numSets, tagBits, tagFoldedBits, pageBits,
         numPageEntries, numPageWays, numPageSets,
         numRegionEntries, numRegionWays, numRegionSets);
+
+#ifndef UNIT_TEST
+    hasDB = true;
+    dbName = "pdede";
+#endif
 }
 
 BTBPDede::~BTBPDede()
 {
 
 }
+
+#ifndef UNIT_TEST
+void
+BTBPDede::setTrace()
+{
+    if (!enableDB) {
+        return;
+    }
+
+    std::vector<std::pair<std::string, DataType>> predFields = {
+        {"startPC", UINT64}, {"predTick", UINT64},
+        {"logicBank", UINT64}, {"phyBank", UINT64},
+        {"alignedAddr", UINT64}, {"monitorIdx", UINT64},
+        {"monitorTag", UINT64}, {"way", UINT64}, {"slot", UINT64},
+        {"isLongSlot", UINT64}, {"fused", UINT64},
+        {"branchPC", UINT64}, {"target", UINT64},
+        {"isCond", UINT64}, {"isDirect", UINT64},
+        {"isIndirect", UINT64}, {"isCall", UINT64},
+        {"isReturn", UINT64}, {"alwaysTaken", UINT64},
+        {"ctr", UINT64}, {"crossPage", UINT64},
+        {"overflow", UINT64}, {"underflow", UINT64},
+        {"pageIdx", UINT64}, {"pageWay", UINT64},
+        {"regionWay", UINT64}, {"hit", UINT64}
+    };
+    predTrace = _db->addAndGetTrace("PDEDEPREDTRACE", predFields);
+    predTrace->init_table();
+
+    std::vector<std::pair<std::string, DataType>> trainFields = {
+        {"startPC", UINT64}, {"exePC", UINT64}, {"controlPC", UINT64},
+        {"target", UINT64}, {"taken", UINT64}, {"mispredict", UINT64},
+        {"predHit", UINT64}, {"dist", UINT64}, {"canUseShortSlot", UINT64},
+        {"updateIsFused", UINT64}, {"bankIdx", UINT64},
+        {"monitorIdx", UINT64}, {"monitorTag", UINT64},
+        {"pageIdx", UINT64}, {"vpnLower", UINT64}, {"vpnUpper", UINT64},
+        {"foundWay", UINT64}, {"foundSlot", UINT64},
+        {"lookupHitWay", UINT64}, {"lookupHitShortSlot", UINT64},
+        {"lookupHitLongSlot", UINT64}, {"lookupMiss", UINT64},
+        {"chooseInvalidWay", UINT64}, {"choosePartialInvalidSlot", UINT64},
+        {"replaceSameType", UINT64}, {"fuseOnUnfusedWay", UINT64},
+        {"unfusedOnFusedWay", UINT64}, {"fusedVictimFused", UINT64},
+        {"fusedVictimUnfused", UINT64}, {"allocPageEntry", UINT64},
+        {"allocRegionEntry", UINT64}, {"reusePageEntry", UINT64},
+        {"reuseRegionEntry", UINT64}, {"counterUpdate", UINT64},
+        {"finalWay", UINT64}, {"finalSlot", UINT64}, {"finalFused", UINT64},
+        {"finalCrossPage", UINT64}, {"finalPageIdx", UINT64},
+        {"finalPageWay", UINT64}, {"finalRegionWay", UINT64},
+        {"oldAlwaysTaken", UINT64}, {"newAlwaysTaken", UINT64},
+        {"oldCtr", UINT64}, {"newCtr", UINT64}, {"writeSuccess", UINT64}
+    };
+    trainTrace = _db->addAndGetTrace("PDEDETRAINTRACE", trainFields);
+    trainTrace->init_table();
+}
+#endif
 
 std::shared_ptr<void> BTBPDede::getPredictionMeta()
 {
@@ -385,7 +443,75 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
     stats.predHitEntries += btbEntries.size();
 
     meta = std::make_shared<BTBPDedeMeta>();
+    meta->startPC = pc;
     meta->btbEntries = btbEntries;
+
+#ifndef UNIT_TEST
+    if (enableDB && predTrace) {
+        for (unsigned i = 0; i < numAlignBanks; ++i) {
+            unsigned phyBankIdx = getPhysicalAlignBankIdx(pc, i);
+            const auto &bank = originEntries[phyBankIdx];
+            Addr alignedAddr = (pc & ~(blockSize - 1)) + blockSize * i;
+            Addr monitorBTBIdx = getMonitorBTBIdx(alignedAddr);
+            Addr monitorBTBTag = getMonitorBTBTag(alignedAddr);
+
+            for (unsigned way = 0; way < numWays; ++way) {
+                const auto &entry = bank[way];
+                if (!entry.fused) {
+                    for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                        const auto &shortSlot = entry.shortSlots[slot];
+                        if (!shortSlot.valid) {
+                            continue;
+                        }
+                        PDedePredTrace rec;
+                        Addr target = getShortSlotTarget(shortSlot.bi.pc, shortSlot,
+                                                         shortSlotTargetBits);
+                        rec.set(pc, curTick(), i, phyBankIdx, alignedAddr,
+                                monitorBTBIdx, monitorBTBTag, way, slot, 0,
+                                entry.fused, shortSlot.bi.pc, target,
+                                shortSlot.bi.isCond, shortSlot.bi.isDirect,
+                                shortSlot.bi.isIndirect, shortSlot.bi.isCall,
+                                shortSlot.bi.isReturn, shortSlot.alwaysTaken,
+                                shortSlot.ctr, 0, 0, 0, numPageSets,
+                                numPageWays, numRegionWays,
+                                entry.tag == monitorBTBTag &&
+                                    shortSlot.bi.pc >= pc && shortSlot.bi.pc < endPc);
+                        predTrace->write_record(rec);
+                    }
+                } else if (entry.shortSlots[0].valid) {
+                    const auto &longSlot = entry.longSlot;
+                    PDedePredTrace rec;
+                    Addr target = getLongSlotTarget(longSlot.bi.pc, longSlot,
+                                                    longSlotTargetBits);
+                    rec.set(pc, curTick(), i, phyBankIdx, alignedAddr,
+                            monitorBTBIdx, monitorBTBTag, way, 0, 1,
+                            entry.fused, longSlot.bi.pc, target,
+                            longSlot.bi.isCond, longSlot.bi.isDirect,
+                            longSlot.bi.isIndirect, longSlot.bi.isCall,
+                            longSlot.bi.isReturn, entry.shortSlots[0].alwaysTaken,
+                            entry.shortSlots[0].ctr, longSlot.isCrossPage,
+                            longSlot.isOverflow, longSlot.isUnderflow,
+                            longSlot.index, longSlot.way,
+                            (longSlot.index < numPageSets && longSlot.way < numPageWays &&
+                             pageBTB[longSlot.index][longSlot.way].valid) ?
+                                pageBTB[longSlot.index][longSlot.way].way : numRegionWays,
+                            entry.tag == monitorBTBTag &&
+                                longSlot.bi.pc >= pc && longSlot.bi.pc < endPc);
+                    predTrace->write_record(rec);
+                }
+            }
+        }
+
+        if (btbEntries.empty()) {
+            PDedePredTrace rec;
+            rec.set(pc, curTick(), numAlignBanks, numAlignBanks, 0,
+                    numSets, 0, numWays, shortSlots, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    numPageSets, numPageWays, numRegionWays, 0);
+            predTrace->write_record(rec);
+        }
+    }
+#endif
 
     return btbEntries;
 }
@@ -516,7 +642,7 @@ BTBPDede::prepareUpdateEntries(const FetchTarget &stream)
     return all_entries;
 }
 
-void
+bool
 BTBPDede::checkPredictionHit(const FetchTarget &stream,
                              const BTBPDede::BTBPDedeMeta *meta)
 {
@@ -539,6 +665,8 @@ BTBPDede::checkPredictionHit(const FetchTarget &stream,
             stream.exeBranchInfo.pc, stream.getControlPC(), stream.exeTaken);
         stats.updateHit++;
     }
+
+    return pred_branch_hit;
 }
 
 unsigned distance(Addr pc, Addr target) {
@@ -576,7 +704,8 @@ bool BTBPDede::isCrossPage(Addr pc, Addr target) {
     return pcVpn != targetVpn;
 }
 
-void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &stream) {
+void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &stream,
+                                   bool predHit) {
     Addr pc = entry.pc;
     Addr target = entry.target;
     bool isMispredict = stream.squashType == SQUASH_CTRL && stream.squashPC == pc;
@@ -599,6 +728,41 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     unsigned pageBTBIdx = getPageBTBIdx(target, longSlotTargetBits);
     Addr vpnLower = getVpnLower(target, longSlotTargetBits);
     Addr vpnUpper = getVpnUpper(target, longSlotTargetBits);
+
+#ifndef UNIT_TEST
+    struct TrainTraceState
+    {
+        uint64_t chooseInvalidWay = 0;
+        uint64_t choosePartialInvalidSlot = 0;
+        uint64_t replaceSameType = 0;
+        uint64_t fuseOnUnfusedWay = 0;
+        uint64_t unfusedOnFusedWay = 0;
+        uint64_t fusedVictimFused = 0;
+        uint64_t fusedVictimUnfused = 0;
+        uint64_t allocPageEntry = 0;
+        uint64_t allocRegionEntry = 0;
+        uint64_t reusePageEntry = 0;
+        uint64_t reuseRegionEntry = 0;
+        uint64_t counterUpdate = 0;
+        uint64_t finalWay = 0;
+        uint64_t finalSlot = 0;
+        uint64_t finalFused = 0;
+        uint64_t finalCrossPage = 0;
+        uint64_t finalPageIdx = 0;
+        uint64_t finalPageWay = 0;
+        uint64_t finalRegionWay = 0;
+        uint64_t oldAlwaysTaken = 0;
+        uint64_t newAlwaysTaken = 0;
+        int64_t oldCtr = 0;
+        int64_t newCtr = 0;
+        uint64_t writeSuccess = 0;
+    } traceState;
+    traceState.finalWay = numWays;
+    traceState.finalSlot = shortSlots;
+    traceState.finalPageIdx = numPageSets;
+    traceState.finalPageWay = numPageWays;
+    traceState.finalRegionWay = numRegionWays;
+#endif
 
     DPRINTF(BTBPDede,
         "BTBPDede: updateResolvedEntry pc=%#lx target=%#lx thisTaken=%d \
@@ -701,6 +865,9 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
             unsigned writeRegionWay = foundRegionWay;
 
             if (foundPageWay == numPageWays) { // page btb miss
+#ifndef UNIT_TEST
+                traceState.allocPageEntry = 1;
+#endif
                 auto maxRrpvIt = std::max_element(pageBTBSetRrpv.begin(), pageBTBSetRrpv.end());
                 unsigned maxRrpvWay = std::distance(pageBTBSetRrpv.begin(), maxRrpvIt);
                 unsigned maxRrpv = *maxRrpvIt;
@@ -711,8 +878,14 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 pageBTBSetRrpv[victimPageWay] = pageMaxRrpv - 1;
             } else {
                 pageBTBSetRrpv[writePageWay] = 0;
+#ifndef UNIT_TEST
+                traceState.reusePageEntry = 1;
+#endif
             }
             if (foundRegionWay == numRegionWays) { // region btb miss
+#ifndef UNIT_TEST
+                traceState.allocRegionEntry = 1;
+#endif
                 auto maxRrpvIt = std::max_element(regionBTBSetRrpv.begin(), regionBTBSetRrpv.end());
                 unsigned maxRrpvWay = std::distance(regionBTBSetRrpv.begin(), maxRrpvIt);
                 unsigned maxRrpv = *maxRrpvIt;
@@ -724,6 +897,9 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 regionBTBSetRrpv[victimRegionWay] = regionMaxRrpv - 1;
             } else {
                 regionBTBSetRrpv[writeRegionWay] = 0;
+#ifndef UNIT_TEST
+                traceState.reuseRegionEntry = 1;
+#endif
             }
             toWrite.longSlot.index = pageBTBIdx;
             toWrite.longSlot.way = writePageWay;
@@ -762,6 +938,22 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         if (entry.isCond && !thisBranchTaken) {
             DPRINTF(BTBPDede,
                 "BTBPDede: skip allocate not-taken conditional pc=%#lx\n", pc);
+#ifndef UNIT_TEST
+            if (enableDB && trainTrace) {
+                PDedeTrainTrace rec;
+                rec.set(stream.startPC, pc, stream.getControlPC(), target,
+                        thisBranchTaken, isMispredict, predHit, dist,
+                        canUseShortSlot, updateIsFused, bankIdx, monitorBTBIdx,
+                        monitorBTBTag, pageBTBIdx, vpnLower, vpnUpper,
+                        foundWay, foundSlot, foundWay != numWays,
+                        foundWay != numWays && foundSlot != shortSlots,
+                        foundWay != numWays && foundSlot == shortSlots,
+                        foundWay == numWays, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        numWays, shortSlots, 0, 0, numPageSets, numPageWays,
+                        numRegionWays, 0, 0, 0, 0, 0);
+                trainTrace->write_record(rec);
+            }
+#endif
             return;
         }
         // check paritially invalid slot
@@ -773,6 +965,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 if (toUpdateSet[way].tag != monitorBTBTag) continue;
 
                 stats.updateWritePartialInvalidSlot++;
+#ifndef UNIT_TEST
+                traceState.choosePartialInvalidSlot = 1;
+                traceState.finalWay = way;
+                traceState.finalSlot = slot;
+                traceState.finalFused = 0;
+#endif
                 DPRINTF(BTBPDede,
                     "BTBPDede: allocate partial-invalid slot pc=%#lx way=%u slot=%u fused=%d\n",
                     pc, way, slot, updateIsFused);
@@ -790,6 +988,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         for (unsigned way = 0; way < numWays; ++way) {
             if (!toUpdateSet[way].shortSlots[0].valid && !toUpdateSet[way].shortSlots[1].valid) {
                 stats.updateWriteInvalidWay++;
+#ifndef UNIT_TEST
+                traceState.chooseInvalidWay = 1;
+                traceState.finalWay = way;
+                traceState.finalSlot = 0;
+                traceState.finalFused = updateIsFused;
+#endif
                 DPRINTF(BTBPDede,
                     "BTBPDede: allocate invalid way pc=%#lx way=%u fused=%d\n",
                     pc, way, updateIsFused);
@@ -813,6 +1017,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         // if no invalid entry, need to replace the entry with max RRPV
         if (updateIsFused == toUpdateSet[maxRrpvWay].fused) {
             stats.updateWriteReplaceSameType++;
+#ifndef UNIT_TEST
+            traceState.replaceSameType = 1;
+            traceState.finalWay = maxRrpvWay;
+            traceState.finalSlot = updateIsFused ? 0 : (maxRrpvDistance % shortSlots);
+            traceState.finalFused = updateIsFused;
+#endif
             DPRINTF(BTBPDede,
                 "BTBPDede: replace same-type pc=%#lx victimWay=%u fused=%d maxRrpvDistance=%u buddy=%u\n",
                 pc, maxRrpvWay, updateIsFused, maxRrpvDistance, maxRrpvDistanceBuddy);
@@ -855,8 +1065,11 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                 toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
             }
         } else {
-            if (updateIsFused) { // write fused entry with unfused entry
+            if (updateIsFused) { // write unfused entry with fused entry
                 stats.updateWriteFuseOnUnfusedWay++;
+#ifndef UNIT_TEST
+                traceState.fuseOnUnfusedWay = 1;
+#endif
                 DPRINTF(BTBPDede,
                     "BTBPDede: convert unfused->fused pc=%#lx victimWay=%u buddyRrpv=%u\n",
                     pc, maxRrpvWay, toUpdateRrpvSet[maxRrpvDistanceBuddy]);
@@ -885,12 +1098,21 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                     // if has fused entry with higher RRPV, replace it;
                     if (foundFusedVictim) {
                         stats.updateWriteFusedVictimFused++;
+#ifndef UNIT_TEST
+                        traceState.fusedVictimFused = 1;
+                        traceState.finalWay = fusedVictimWay;
+                        traceState.finalSlot = 0;
+                        traceState.finalFused = 1;
+#endif
                         writeFusedEntry(toUpdateSet[fusedVictimWay]);
                         writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
                         toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
                         toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
                     } else { // no fused entry, replace unfused entry which has the least sum of rrpv
                         stats.updateWriteFusedVictimUnfused++;
+#ifndef UNIT_TEST
+                        traceState.fusedVictimUnfused = 1;
+#endif
                         unsigned unfusedVictimWay = numWays;
                         unsigned unfusedVictimRrpvSum = 0;
                         bool foundUnfusedVictim = false;
@@ -913,11 +1135,16 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                         }
                         writeFusedEntry(toUpdateSet[unfusedVictimWay]);
                         writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
+#ifndef UNIT_TEST
+                        traceState.finalWay = unfusedVictimWay;
+                        traceState.finalSlot = 0;
+                        traceState.finalFused = 1;
+#endif
                         toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
                         toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
                     }
                 }
-            } else { // write unfused entry with fused entry
+            } else { // write fused entry with unfused entry
                 unsigned unfusedVictimDistance = toUpdateRrpvSet.size();
                 unsigned unfusedVictimRrpv = 0;
                 bool foundUnfusedVictim = false;
@@ -942,6 +1169,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
 
                 if (toUpdateSet[maxRrpvWay].fused) {
                     stats.updateWriteUnfusedOnFusedWay++;
+#ifndef UNIT_TEST
+                    traceState.unfusedOnFusedWay = 1;
+                    traceState.finalWay = maxRrpvWay;
+                    traceState.finalSlot = 0;
+                    traceState.finalFused = 0;
+#endif
                     DPRINTF(BTBPDede,
                         "BTBPDede: convert fused->unfused pc=%#lx victimWay=%u\n",
                         pc, maxRrpvWay);
@@ -960,6 +1193,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
                     toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
                 } else {
                     stats.updateWriteReplaceSameType++;
+#ifndef UNIT_TEST
+                    traceState.replaceSameType = 1;
+                    traceState.finalWay = maxRrpvWay;
+                    traceState.finalSlot = maxRrpvDistance % shortSlots;
+                    traceState.finalFused = 0;
+#endif
                     DPRINTF(BTBPDede,
                         "BTBPDede: replace same-type pc=%#lx victimWay=%u fused=%d maxRrpvDistance=%u buddy=%u\n",
                         pc, maxRrpvWay, updateIsFused, maxRrpvDistance, maxRrpvDistanceBuddy);
@@ -997,12 +1236,22 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         }
     } else { // hit
         if (foundSlot != shortSlots) { // hit short slot
+#ifndef UNIT_TEST
+            traceState.finalWay = foundWay;
+            traceState.finalSlot = foundSlot;
+            traceState.finalFused = 0;
+#endif
             auto &slot = toUpdateSet[foundWay].shortSlots[foundSlot];
             slot.bi = BranchInfo(entry);
             slot.bi.resolved = false;
             writtenSlot = &slot;
             toUpdateRrpvSet[foundWay * shortSlots + foundSlot] = 0;
         } else { // hit long slot
+#ifndef UNIT_TEST
+            traceState.finalWay = foundWay;
+            traceState.finalSlot = 0;
+            traceState.finalFused = 1;
+#endif
             writeFusedEntry(toUpdateSet[foundWay]);
             writtenSlot = &toUpdateSet[foundWay].shortSlots[0];
             toUpdateRrpvSet[foundWay * shortSlots] = 0;
@@ -1015,6 +1264,11 @@ _counter_update:
     if (writtenSlot && entry.isCond) {
         int oldCtr = writtenSlot->ctr;
         bool oldAlwaysTaken = writtenSlot->alwaysTaken;
+#ifndef UNIT_TEST
+        traceState.counterUpdate = 1;
+        traceState.oldCtr = oldCtr;
+        traceState.oldAlwaysTaken = oldAlwaysTaken;
+#endif
         if (foundWay == numWays) { // miss
             writtenSlot->alwaysTaken = thisBranchTaken;
             writtenSlot->ctr = thisBranchTaken ? 0 : -1;
@@ -1034,7 +1288,65 @@ _counter_update:
             "BTBPDede: cond state update pc=%#lx taken=%d alwaysTaken %d->%d ctr %d->%d\n",
             pc, thisBranchTaken, oldAlwaysTaken, writtenSlot->alwaysTaken,
             oldCtr, writtenSlot->ctr);
+#ifndef UNIT_TEST
+        traceState.newCtr = writtenSlot->ctr;
+        traceState.newAlwaysTaken = writtenSlot->alwaysTaken;
+#endif
     }
+
+#ifndef UNIT_TEST
+    if (writtenSlot) {
+        traceState.writeSuccess = 1;
+        if (traceState.finalWay == numWays) {
+            traceState.finalWay = foundWay;
+        }
+        if (!traceState.finalFused && traceState.finalSlot == shortSlots && foundSlot != shortSlots) {
+            traceState.finalSlot = foundSlot;
+        }
+        if (traceState.finalFused) {
+            const auto &finalEntry = toUpdateSet[traceState.finalWay];
+            traceState.finalCrossPage = finalEntry.longSlot.isCrossPage;
+            traceState.finalPageIdx = finalEntry.longSlot.index;
+            traceState.finalPageWay = finalEntry.longSlot.way;
+            if (finalEntry.longSlot.index < numPageSets &&
+                finalEntry.longSlot.way < numPageWays &&
+                pageBTB[finalEntry.longSlot.index][finalEntry.longSlot.way].valid) {
+                traceState.finalRegionWay =
+                    pageBTB[finalEntry.longSlot.index][finalEntry.longSlot.way].way;
+            }
+        }
+    }
+
+    if (enableDB && trainTrace) {
+        PDedeTrainTrace rec;
+        rec.set(stream.startPC, pc, stream.getControlPC(), target,
+                thisBranchTaken, isMispredict, predHit, dist,
+                canUseShortSlot, updateIsFused, bankIdx, monitorBTBIdx,
+                monitorBTBTag, pageBTBIdx, vpnLower, vpnUpper,
+                foundWay, foundSlot, foundWay != numWays,
+                foundWay != numWays && foundSlot != shortSlots,
+                foundWay != numWays && foundSlot == shortSlots,
+                foundWay == numWays, traceState.chooseInvalidWay,
+                traceState.choosePartialInvalidSlot,
+                traceState.replaceSameType,
+                traceState.fuseOnUnfusedWay,
+                traceState.unfusedOnFusedWay,
+                traceState.fusedVictimFused,
+                traceState.fusedVictimUnfused,
+                traceState.allocPageEntry,
+                traceState.allocRegionEntry,
+                traceState.reusePageEntry,
+                traceState.reuseRegionEntry,
+                traceState.counterUpdate,
+                traceState.finalWay, traceState.finalSlot,
+                traceState.finalFused, traceState.finalCrossPage,
+                traceState.finalPageIdx, traceState.finalPageWay,
+                traceState.finalRegionWay, traceState.oldAlwaysTaken,
+                traceState.newAlwaysTaken, traceState.oldCtr,
+                traceState.newCtr, traceState.writeSuccess);
+        trainTrace->write_record(rec);
+    }
+#endif
 
     dumpUpdateState(bankIdx, monitorBTBIdx, pageBTBIdx, vpnUpper);
 }
@@ -1046,11 +1358,11 @@ void BTBPDede::update(const FetchTarget& stream) {
 
     auto meta_from_update =
         std::static_pointer_cast<BTBPDedeMeta>(stream.predMetas[getComponentIdx()]);
-    checkPredictionHit(stream, meta_from_update.get());
+    bool predHit = checkPredictionHit(stream, meta_from_update.get());
 
     auto entries_need_update = prepareUpdateEntries(stream);
     for (const auto &entry_to_update : entries_need_update) {
-       updateResolvedEntry(entry_to_update, stream);
+       updateResolvedEntry(entry_to_update, stream, predHit);
     }
 }
 

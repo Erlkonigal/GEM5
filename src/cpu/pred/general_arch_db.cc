@@ -1,4 +1,6 @@
 
+#include <string>
+
 #include "general_arch_db.hh"
 
 namespace gem5{
@@ -20,48 +22,39 @@ sqliteSignedInt(uint64_t value)
 
 void
 TraceManager::init_table() {
-  // create table
-  char sql[1024];
-  int pos = 0;
-  pos = sprintf(sql,
-    "CREATE TABLE %s(" \
-    "ID INTEGER PRIMARY KEY AUTOINCREMENT, " \
-    "TICK INT NOT NULL", _name.c_str());
-  for (auto it = _fields.begin(); it != _fields.end(); it++) {
-    switch (it->second) {
-      case UINT64:
-        pos += sprintf(sql+pos, ",%s INT NOT NULL", it->first.c_str());
-        break;
-      case TEXT:
-        pos += sprintf(sql+pos, ",%s TEXT", it->first.c_str());
-        break;
-      default:
-        fatal("Unknown data type");
+    std::string sql = "CREATE TABLE " + _name +
+        "(ID INTEGER PRIMARY KEY AUTOINCREMENT, TICK INT NOT NULL";
+    for (auto it = _fields.begin(); it != _fields.end(); it++) {
+        switch (it->second) {
+          case UINT64:
+            sql += "," + it->first + " INT NOT NULL";
+            break;
+          case TEXT:
+            sql += "," + it->first + " TEXT";
+            break;
+          default:
+            fatal("Unknown data type");
+        }
     }
-  }
-  pos += sprintf(sql+pos, ");");
-  assert(pos < 1024);
-  printf("%s\n", sql);
-  char *zErrMsg;
-  int rc = sqlite3_exec(_db, sql, callback, 0, &zErrMsg);
-  if (rc != SQLITE_OK) {
-    fatal("SQL error: %s\n", zErrMsg);
-  } else {
-    warn("Table created: %s\n", _name.c_str());
-  }
+    sql += ");";
+    printf("%s\n", sql.c_str());
+    char *zErrMsg;
+    int rc = sqlite3_exec(_db, sql.c_str(), callback, 0, &zErrMsg);
+    if (rc != SQLITE_OK) {
+        fatal("SQL error: %s\n", zErrMsg);
+    } else {
+        warn("Table created: %s\n", _name.c_str());
+    }
 }
 
 void
 TraceManager::write_record(const Record &record)
 {
-    char sql[1024];
-    int pos = 0;
-    pos = sprintf(sql, "INSERT INTO %s(TICK", _name.c_str());
+    std::string sql = "INSERT INTO " + _name + "(TICK";
     for (auto it = _fields.begin(); it != _fields.end(); it++) {
-        pos += sprintf(sql+pos, ",%s", it->first.c_str());
+        sql += "," + it->first;
     }
-    pos += sprintf(sql+pos, ") VALUES(%lld",
-        sqliteSignedInt(record._tick));
+    sql += ") VALUES(" + std::to_string(sqliteSignedInt(record._tick));
     for (auto it = _fields.begin(); it != _fields.end(); it++) {
         switch (it->second) {
             case UINT64:
@@ -72,8 +65,7 @@ TraceManager::write_record(const Record &record)
                     fatal("Can't find data for %s\n", it->first.c_str());
                 }
                 assert(data != m.end());
-                pos += sprintf(sql+pos, ",%lld",
-                    sqliteSignedInt(data->second));
+                sql += "," + std::to_string(sqliteSignedInt(data->second));
                 break;
             }
             case TEXT:
@@ -84,17 +76,16 @@ TraceManager::write_record(const Record &record)
                     fatal("Can't find data for %s\n", it->first.c_str());
                 }
                 assert(data != m.end());
-                pos += sprintf(sql+pos, ",'%s'", data->second.c_str());
+                sql += ",'" + data->second + "'";
                 break;
             }
             default:
                 fatal("Unknown data type!\n");
         }
     }
-    pos += sprintf(sql+pos, ");");
-    assert(pos < 1024);
+    sql += ");";
     char *zErrMsg;
-    int rc = sqlite3_exec(_db, sql, callback, 0, &zErrMsg);
+    int rc = sqlite3_exec(_db, sql.c_str(), callback, 0, &zErrMsg);
     if (rc != SQLITE_OK) {
         fatal("SQL error: %s\n", zErrMsg);
     };
