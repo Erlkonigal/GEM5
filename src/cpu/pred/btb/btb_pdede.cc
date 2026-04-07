@@ -358,7 +358,7 @@ std::vector<BTBEntry> BTBPDede::processMonitorEntries(Addr pc, const std::vector
             Addr victimTag = getVictimCacheTag(monitorTag, monitorIdx);
 
             if (!entry.valid) continue;
-            if (branchPC < pc || branchPC >= (pc + predictWidth)) continue;
+            if (branchPC < pc || branchPC >= ((pc + predictWidth) & ~mask(floorLog2(predictWidth) - 1))) continue;
             if (entry.tag != (way < numWays ? monitorTag : victimTag)) continue;
 
             DPRINTF(BTBPDede, "BTBPDede: use entry from %s way %d for bank %d alignedAddr %#lx\n",
@@ -590,6 +590,11 @@ void BTBPDede::update(const FetchTarget& stream) {
     auto entries_need_update = prepareUpdateEntries(stream);
     for (const auto &entry_to_update : entries_need_update) {
         BranchInfo exec = entry_to_update;
+
+        if (stream.exeBranchInfo.pc == exec.pc && stream.exeTaken && stream.exeBranchInfo.isIndirect) {
+            // exec.target = stream.exeBranchInfo.target;
+        }
+
         unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
         unsigned monitorIdx = getMonitorIdx(exec.pc);
         unsigned monitorTag = getMonitorTag(exec.pc);
