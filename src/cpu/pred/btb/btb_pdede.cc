@@ -1,6 +1,6 @@
 #include <algorithm>
+#include <limits>
 
-#include "base/random.hh"
 #include "btb_pdede.hh"
 #include "cpu/o3/dyn_inst.hh"
 
@@ -125,10 +125,10 @@ BTBPDede::setTrace()
         {"foundWay", UINT64}, {"foundSlot", UINT64},
         {"lookupHitWay", UINT64}, {"lookupHitShortSlot", UINT64},
         {"lookupHitLongSlot", UINT64}, {"lookupMiss", UINT64},
-        {"chooseInvalidWay", UINT64}, {"choosePartialInvalidSlot", UINT64},
-        {"replaceSameType", UINT64}, {"fuseOnUnfusedWay", UINT64},
-        {"unfusedOnFusedWay", UINT64}, {"fusedVictimFused", UINT64},
-        {"fusedVictimUnfused", UINT64}, {"allocPageEntry", UINT64},
+        {"chooseInvalidWay", UINT64}, {"chooseSameTagFreeSlot", UINT64},
+        {"chooseReplaceSameTagSlot", UINT64}, {"chooseBreakFusedWay", UINT64},
+        {"chooseRetagUnfusedWay", UINT64}, {"chooseReplaceFusedWay", UINT64},
+        {"chooseReplaceUnfusedPair", UINT64}, {"allocPageEntry", UINT64},
         {"allocRegionEntry", UINT64}, {"reusePageEntry", UINT64},
         {"reuseRegionEntry", UINT64}, {"counterUpdate", UINT64},
         {"finalWay", UINT64}, {"finalSlot", UINT64}, {"finalFused", UINT64},
@@ -711,9 +711,9 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     bool isMispredict = stream.squashType == SQUASH_CTRL && stream.squashPC == pc;
     bool thisBranchTaken = stream.exeTaken && stream.exeBranchInfo.pc == pc;
 
-    if (entry.isIndirect && thisBranchTaken) {
-        target = stream.exeBranchInfo.target;
-    }
+    // if (entry.isIndirect && thisBranchTaken && isMispredict) {
+    //     target = stream.exeBranchInfo.target;
+    // }
 
     unsigned dist = distance(pc, target);
 
@@ -733,12 +733,12 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     struct TrainTraceState
     {
         uint64_t chooseInvalidWay = 0;
-        uint64_t choosePartialInvalidSlot = 0;
-        uint64_t replaceSameType = 0;
-        uint64_t fuseOnUnfusedWay = 0;
-        uint64_t unfusedOnFusedWay = 0;
-        uint64_t fusedVictimFused = 0;
-        uint64_t fusedVictimUnfused = 0;
+        uint64_t chooseSameTagFreeSlot = 0;
+        uint64_t chooseReplaceSameTagSlot = 0;
+        uint64_t chooseBreakFusedWay = 0;
+        uint64_t chooseRetagUnfusedWay = 0;
+        uint64_t chooseReplaceFusedWay = 0;
+        uint64_t chooseReplaceUnfusedPair = 0;
         uint64_t allocPageEntry = 0;
         uint64_t allocRegionEntry = 0;
         uint64_t reusePageEntry = 0;
@@ -913,29 +913,242 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
 
     // entry update
     MonitorShortSlot *writtenSlot = nullptr;
-
-    auto chooseMaxRrpvDistance = [&]() {
-        auto maxRrpvIt = std::max_element(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end());
-        unsigned bestDistance = std::distance(toUpdateRrpvSet.begin(), maxRrpvIt);
-        unsigned bestRrpv = *maxRrpvIt;
-        bool allEqual = std::all_of(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(),
-            [&](unsigned rrpv) { return rrpv == bestRrpv; });
-        if (allEqual) {
-            bestDistance = random_mt.random<unsigned>(0, toUpdateRrpvSet.size() - 1);
-        }
-        return bestDistance;
-    };
     auto clearLongSlot = [](MonitorEntry &entry) {
         entry.longSlot = MonitorLongSlot();
     };
-    unsigned maxRrpvDistance = chooseMaxRrpvDistance();
-    unsigned maxRrpvDistanceBuddy = maxRrpvDistance ^ 1;
-    unsigned maxRrpvWay = maxRrpvDistance / shortSlots;
-    unsigned maxRrpv = toUpdateRrpvSet[maxRrpvDistance];
+    auto installShortSlot = [&](MonitorShortSlot &slot) {
+        slot = MonitorShortSlot();
+        slot.valid = true;
+        slot.bi = BranchInfo(entry);
+        slot.bi.resolved = false;
+    };
+    auto isWayInvalid = [&](unsigned way) {
+        return !toUpdateSet[way].shortSlots[0].valid &&
+               !toUpdateSet[way].shortSlots[1].valid;
+    };
+    auto hasAnyShortSlot = [&](unsigned way) {
+        return toUpdateSet[way].shortSlots[0].valid ||
+               toUpdateSet[way].shortSlots[1].valid;
+    };
+    auto slotValue = [&](unsigned way, unsigned slot) {
+        if (!toUpdateSet[way].shortSlots[slot].valid) {
+            return 0u;
+        }
+        unsigned rawRrpv = std::min(toUpdateRrpvSet[way * shortSlots + slot],
+                                    monitorMaxRrpv);
+        return monitorMaxRrpv - rawRrpv + 1;
+    };
+    auto fusedValue = [&](unsigned way) {
+        return slotValue(way, 0);
+    };
+    auto pairValue = [&](unsigned way) {
+        // return slotValue(way, 0) + slotValue(way, 1);
+        return std::max(slotValue(way, 0), slotValue(way, 1));
+    };
+    auto ageMonitorSetOnMiss = [&]() {
+        unsigned maxValidRrpv = 0;
+        bool hasValidEntry = false;
+
+        for (unsigned way = 0; way < numWays; ++way) {
+            if (toUpdateSet[way].fused) {
+                if (!toUpdateSet[way].shortSlots[0].valid) {
+                    continue;
+                }
+                unsigned idx = way * shortSlots;
+                maxValidRrpv = std::max(maxValidRrpv,
+                    std::min(toUpdateRrpvSet[idx], monitorMaxRrpv));
+                hasValidEntry = true;
+                continue;
+            }
+            for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                if (!toUpdateSet[way].shortSlots[slot].valid) {
+                    continue;
+                }
+                unsigned idx = way * shortSlots + slot;
+                maxValidRrpv = std::max(maxValidRrpv,
+                    std::min(toUpdateRrpvSet[idx], monitorMaxRrpv));
+                hasValidEntry = true;
+            }
+        }
+
+        if (!hasValidEntry || maxValidRrpv >= monitorMaxRrpv) {
+            return;
+        }
+
+        // Standard RRIP ages the set until at least one replacement
+        // candidate reaches max RRPV instead of advancing every entry by 1.
+        unsigned ageDelta = monitorMaxRrpv - maxValidRrpv;
+        for (unsigned way = 0; way < numWays; ++way) {
+            if (toUpdateSet[way].fused) {
+                if (!toUpdateSet[way].shortSlots[0].valid) {
+                    continue;
+                }
+                for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                    unsigned idx = way * shortSlots + slot;
+                    toUpdateRrpvSet[idx] = std::min(
+                        toUpdateRrpvSet[idx] + ageDelta, monitorMaxRrpv);
+                }
+                continue;
+            }
+            for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                if (!toUpdateSet[way].shortSlots[slot].valid) {
+                    continue;
+                }
+                unsigned idx = way * shortSlots + slot;
+                toUpdateRrpvSet[idx] = std::min(
+                    toUpdateRrpvSet[idx] + ageDelta, monitorMaxRrpv);
+            }
+        }
+    };
+
+    unsigned numFusedWays = 0;
+    unsigned numUnfusedWays = 0;
+    for (unsigned way = 0; way < numWays; ++way) {
+        if (isWayInvalid(way)) {
+            continue;
+        }
+        if (toUpdateSet[way].fused) {
+            ++numFusedWays;
+        } else {
+            ++numUnfusedWays;
+        }
+    }
+
+    enum class UpdateActionKind
+    {
+        None,
+        UseInvalidWay,
+        UseSameTagFreeSlot,
+        ReplaceSameTagSlot,
+        BreakFusedWay,
+        RetagUnfusedWay,
+        ReplaceFusedWay,
+        ReplaceUnfusedPair,
+    };
+
+    struct UpdateAction
+    {
+        bool valid = false;
+        UpdateActionKind kind = UpdateActionKind::None;
+        unsigned way = 0;
+        unsigned slot = 0;
+        unsigned cost = std::numeric_limits<unsigned>::max();
+        bool finalFused = false;
+    };
+
+    auto shortPriority = [&](UpdateActionKind kind) {
+        switch (kind) {
+          case UpdateActionKind::UseSameTagFreeSlot:
+            return 0u;
+          case UpdateActionKind::UseInvalidWay:
+            return 1u;
+          case UpdateActionKind::BreakFusedWay:
+            return numFusedWays > numUnfusedWays ? 2u : 3u;
+          case UpdateActionKind::ReplaceSameTagSlot:
+            return numFusedWays > numUnfusedWays ? 3u : 2u;
+          case UpdateActionKind::RetagUnfusedWay:
+            return 4u;
+          default:
+            return 5u;
+        }
+    };
+    auto fusedPriority = [&](UpdateActionKind kind) {
+        switch (kind) {
+          case UpdateActionKind::UseInvalidWay:
+            return 0u;
+          case UpdateActionKind::ReplaceUnfusedPair:
+            return numUnfusedWays > numFusedWays ? 1u : 2u;
+          case UpdateActionKind::ReplaceFusedWay:
+            return numUnfusedWays > numFusedWays ? 2u : 1u;
+          default:
+            return 3u;
+        }
+    };
+    auto betterAction = [&](const UpdateAction &cand, const UpdateAction &best,
+                            bool shortReq) {
+        if (!cand.valid) {
+            return false;
+        }
+        if (!best.valid) {
+            return true;
+        }
+        if (cand.cost != best.cost) {
+            return cand.cost < best.cost;
+        }
+        unsigned candPriority = shortReq ? shortPriority(cand.kind)
+                                         : fusedPriority(cand.kind);
+        unsigned bestPriority = shortReq ? shortPriority(best.kind)
+                                         : fusedPriority(best.kind);
+        if (candPriority != bestPriority) {
+            return candPriority < bestPriority;
+        }
+        if (cand.way != best.way) {
+            return cand.way < best.way;
+        }
+        return cand.slot < best.slot;
+    };
+    auto markChosenAction = [&](const UpdateAction &action) {
+        switch (action.kind) {
+          case UpdateActionKind::UseInvalidWay:
+            stats.updateWriteInvalidWay++;
+#ifndef UNIT_TEST
+            traceState.chooseInvalidWay = 1;
+#endif
+            break;
+          case UpdateActionKind::UseSameTagFreeSlot:
+            stats.updateWriteSameTagFreeSlot++;
+#ifndef UNIT_TEST
+            traceState.chooseSameTagFreeSlot = 1;
+#endif
+            break;
+          case UpdateActionKind::ReplaceSameTagSlot:
+            stats.updateWriteReplaceSameTagSlot++;
+#ifndef UNIT_TEST
+            traceState.chooseReplaceSameTagSlot = 1;
+#endif
+            break;
+          case UpdateActionKind::BreakFusedWay:
+            stats.updateWriteBreakFusedWay++;
+#ifndef UNIT_TEST
+            traceState.chooseBreakFusedWay = 1;
+#endif
+            break;
+          case UpdateActionKind::RetagUnfusedWay:
+            stats.updateWriteRetagUnfusedWay++;
+#ifndef UNIT_TEST
+            traceState.chooseRetagUnfusedWay = 1;
+#endif
+            break;
+          case UpdateActionKind::ReplaceFusedWay:
+            stats.updateWriteReplaceFusedWay++;
+#ifndef UNIT_TEST
+            traceState.chooseReplaceFusedWay = 1;
+#endif
+            break;
+          case UpdateActionKind::ReplaceUnfusedPair:
+            stats.updateWriteReplaceUnfusedPair++;
+#ifndef UNIT_TEST
+            traceState.chooseReplaceUnfusedPair = 1;
+#endif
+            break;
+          case UpdateActionKind::None:
+            break;
+        }
+#ifndef UNIT_TEST
+        traceState.finalWay = action.way;
+        traceState.finalSlot = action.slot;
+        traceState.finalFused = action.finalFused;
+#endif
+        DPRINTF(BTBPDede,
+            "BTBPDede: choose update action pc=%#lx action=%u way=%u slot=%u cost=%u finalFused=%d\n",
+            pc, static_cast<unsigned>(action.kind), action.way, action.slot,
+            action.cost, action.finalFused);
+    };
 
     if (foundWay == numWays) { // miss
         // check not taken conditional branch
         if (entry.isCond && !thisBranchTaken) {
+            stats.updateLookupMissNoAllocate++;
             DPRINTF(BTBPDede,
                 "BTBPDede: skip allocate not-taken conditional pc=%#lx\n", pc);
 #ifndef UNIT_TEST
@@ -956,283 +1169,142 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
 #endif
             return;
         }
-        // check paritially invalid slot
-        for (unsigned way = 0; way < numWays; ++way) {
-            if (updateIsFused) continue; // fused entry cannot use partially invalid entry
-            if (toUpdateSet[way].fused) continue;
-            for (unsigned slot = 0; slot < shortSlots; ++slot) {
-                if (toUpdateSet[way].shortSlots[slot].valid) continue;
-                if (toUpdateSet[way].tag != monitorBTBTag) continue;
+        UpdateAction chosenAction;
 
-                stats.updateWritePartialInvalidSlot++;
-#ifndef UNIT_TEST
-                traceState.choosePartialInvalidSlot = 1;
-                traceState.finalWay = way;
-                traceState.finalSlot = slot;
-                traceState.finalFused = 0;
-#endif
-                DPRINTF(BTBPDede,
-                    "BTBPDede: allocate partial-invalid slot pc=%#lx way=%u slot=%u fused=%d\n",
-                    pc, way, slot, updateIsFused);
+        if (!updateIsFused) {
+            for (unsigned way = 0; way < numWays; ++way) {
+                UpdateAction candidate;
+                candidate.way = way;
+                candidate.slot = 0;
+                candidate.finalFused = false;
 
-                toUpdateSet[way].shortSlots[slot].valid = true;
-                toUpdateSet[way].shortSlots[slot].bi = BranchInfo(entry);
-                toUpdateSet[way].shortSlots[slot].bi.resolved = false;
-
-                toUpdateRrpvSet[way * shortSlots + slot] = monitorMaxRrpv - 1;
-                writtenSlot = &toUpdateSet[way].shortSlots[slot];
-                goto _counter_update;
-            }
-        }
-        // check invalid entry
-        for (unsigned way = 0; way < numWays; ++way) {
-            if (!toUpdateSet[way].shortSlots[0].valid && !toUpdateSet[way].shortSlots[1].valid) {
-                stats.updateWriteInvalidWay++;
-#ifndef UNIT_TEST
-                traceState.chooseInvalidWay = 1;
-                traceState.finalWay = way;
-                traceState.finalSlot = 0;
-                traceState.finalFused = updateIsFused;
-#endif
-                DPRINTF(BTBPDede,
-                    "BTBPDede: allocate invalid way pc=%#lx way=%u fused=%d\n",
-                    pc, way, updateIsFused);
-                writtenSlot = &toUpdateSet[way].shortSlots[0];
-                if (updateIsFused) {
-                    writeFusedEntry(toUpdateSet[way]);
-                    toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[way * shortSlots + 1] = monitorMaxRrpv - 1;
-                } else {
-                    toUpdateSet[way].fused = false;
-                    toUpdateSet[way].tag = monitorBTBTag;
-                    clearLongSlot(toUpdateSet[way]);
-                    toUpdateSet[way].shortSlots[0].valid = true;
-                    toUpdateSet[way].shortSlots[0].bi = BranchInfo(entry);
-                    toUpdateSet[way].shortSlots[0].bi.resolved = false;
-                    toUpdateRrpvSet[way * shortSlots] = monitorMaxRrpv - 1;
-                }
-                goto _counter_update;
-            }
-        }
-        // if no invalid entry, need to replace the entry with max RRPV
-        if (updateIsFused == toUpdateSet[maxRrpvWay].fused) {
-            stats.updateWriteReplaceSameType++;
-#ifndef UNIT_TEST
-            traceState.replaceSameType = 1;
-            traceState.finalWay = maxRrpvWay;
-            traceState.finalSlot = updateIsFused ? 0 : (maxRrpvDistance % shortSlots);
-            traceState.finalFused = updateIsFused;
-#endif
-            DPRINTF(BTBPDede,
-                "BTBPDede: replace same-type pc=%#lx victimWay=%u fused=%d maxRrpvDistance=%u buddy=%u\n",
-                pc, maxRrpvWay, updateIsFused, maxRrpvDistance, maxRrpvDistanceBuddy);
-            if (updateIsFused) { // write fused entry with fused entry
-                writeFusedEntry(toUpdateSet[maxRrpvWay]);
-                writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                    [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
-            } else { // write unfused entry with unfused entry
-                bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
-                toUpdateSet[maxRrpvWay].fused = false;
-                toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
-                clearLongSlot(toUpdateSet[maxRrpvWay]);
-                auto writeShortSlot = [&](MonitorShortSlot &slot) {
-                    slot.valid = true;
-                    slot.bi = BranchInfo(entry);
-                    slot.bi.resolved = false;
-                };
-                auto invalidateShortSlot = [&](MonitorShortSlot &slot) {
-                    slot = MonitorShortSlot();
-                };
-                if (maxRrpvDistance % shortSlots == 0) {
-                    writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
-                    if (retagged) {
-                        invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
+                if (isWayInvalid(way)) {
+                    candidate.valid = true;
+                    candidate.kind = UpdateActionKind::UseInvalidWay;
+                    candidate.cost = 0;
+                } else if (!toUpdateSet[way].fused &&
+                           toUpdateSet[way].tag == monitorBTBTag &&
+                           hasAnyShortSlot(way)) {
+                    bool foundFreeSlot = false;
+                    for (unsigned slot = 0; slot < shortSlots; ++slot) {
+                        if (!toUpdateSet[way].shortSlots[slot].valid) {
+                            candidate.valid = true;
+                            candidate.kind = UpdateActionKind::UseSameTagFreeSlot;
+                            candidate.slot = slot;
+                            candidate.cost = 0;
+                            foundFreeSlot = true;
+                            break;
+                        }
                     }
-                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                } else {
-                    writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
-                    if (retagged) {
-                        invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
+                    if (!foundFreeSlot) {
+                        unsigned slot0Value = slotValue(way, 0);
+                        unsigned slot1Value = slotValue(way, 1);
+                        unsigned victimSlot = slot1Value < slot0Value ? 1 : 0;
+                        candidate.valid = true;
+                        candidate.kind = UpdateActionKind::ReplaceSameTagSlot;
+                        candidate.slot = victimSlot;
+                        candidate.cost = slotValue(way, victimSlot);
                     }
-                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
+                } else if (toUpdateSet[way].fused) {
+                    candidate.valid = true;
+                    candidate.kind = UpdateActionKind::BreakFusedWay;
+                    candidate.cost = fusedValue(way);
+                } else {
+                    candidate.valid = true;
+                    candidate.kind = UpdateActionKind::RetagUnfusedWay;
+                    candidate.cost = pairValue(way);
                 }
 
-                std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                    [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                if (betterAction(candidate, chosenAction, true)) {
+                    chosenAction = candidate;
+                }
             }
         } else {
-            if (updateIsFused) { // write unfused entry with fused entry
-                stats.updateWriteFuseOnUnfusedWay++;
-#ifndef UNIT_TEST
-                traceState.fuseOnUnfusedWay = 1;
-#endif
-                DPRINTF(BTBPDede,
-                    "BTBPDede: convert unfused->fused pc=%#lx victimWay=%u buddyRrpv=%u\n",
-                    pc, maxRrpvWay, toUpdateRrpvSet[maxRrpvDistanceBuddy]);
-                unsigned buddyRrpv = toUpdateRrpvSet[maxRrpvDistanceBuddy];
-                if (buddyRrpv > monitorMaxRrpv / 2) { // not recently used
-                    writeFusedEntry(toUpdateSet[maxRrpvWay]);
-                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv - 1;
-                } else { // recently used
-                    // check all fused entries to find the most rrpv one to replace
-                    unsigned fusedVictimWay = numWays;
-                    unsigned fusedVictimRrpv = 0;
-                    bool foundFusedVictim = false;
-                    for (unsigned way = 0; way < numWays; ++way) {
-                        if (!toUpdateSet[way].fused) continue;
-                        if (!foundFusedVictim ||
-                            toUpdateRrpvSet[way * shortSlots] > fusedVictimRrpv) {
-                            fusedVictimWay = way;
-                            fusedVictimRrpv = toUpdateRrpvSet[way * shortSlots];
-                            foundFusedVictim = true;
-                        }
-                    }
-                    // if has fused entry with higher RRPV, replace it;
-                    if (foundFusedVictim) {
-                        stats.updateWriteFusedVictimFused++;
-#ifndef UNIT_TEST
-                        traceState.fusedVictimFused = 1;
-                        traceState.finalWay = fusedVictimWay;
-                        traceState.finalSlot = 0;
-                        traceState.finalFused = 1;
-#endif
-                        writeFusedEntry(toUpdateSet[fusedVictimWay]);
-                        writtenSlot = &toUpdateSet[fusedVictimWay].shortSlots[0];
-                        toUpdateRrpvSet[fusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
-                        toUpdateRrpvSet[fusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
-                    } else { // no fused entry, replace unfused entry which has the least sum of rrpv
-                        stats.updateWriteFusedVictimUnfused++;
-#ifndef UNIT_TEST
-                        traceState.fusedVictimUnfused = 1;
-#endif
-                        unsigned unfusedVictimWay = numWays;
-                        unsigned unfusedVictimRrpvSum = 0;
-                        bool foundUnfusedVictim = false;
-                        for (unsigned way = 0; way < numWays; ++way) {
-                            if (toUpdateSet[way].fused) continue;
-                            unsigned rrpvSum = toUpdateRrpvSet[way * shortSlots] + \
-                                toUpdateRrpvSet[way * shortSlots + 1];
-                            if (!foundUnfusedVictim ||
-                                rrpvSum > unfusedVictimRrpvSum) {
-                                unfusedVictimWay = way;
-                                unfusedVictimRrpvSum = rrpvSum;
-                                foundUnfusedVictim = true;
-                            }
-                        }
-                        if (!foundUnfusedVictim) {
-                            DPRINTF(BTBPDede,
-                                "BTBPDede: all ways fused with low RRPV, fallback replace victimWay=%u pc=%#lx\n",
-                                maxRrpvWay, pc);
-                            unfusedVictimWay = maxRrpvWay;
-                        }
-                        writeFusedEntry(toUpdateSet[unfusedVictimWay]);
-                        writtenSlot = &toUpdateSet[unfusedVictimWay].shortSlots[0];
-#ifndef UNIT_TEST
-                        traceState.finalWay = unfusedVictimWay;
-                        traceState.finalSlot = 0;
-                        traceState.finalFused = 1;
-#endif
-                        toUpdateRrpvSet[unfusedVictimWay * shortSlots] = monitorMaxRrpv - 1;
-                        toUpdateRrpvSet[unfusedVictimWay * shortSlots + 1] = monitorMaxRrpv - 1;
-                    }
-                }
-            } else { // write fused entry with unfused entry
-                unsigned unfusedVictimDistance = toUpdateRrpvSet.size();
-                unsigned unfusedVictimRrpv = 0;
-                bool foundUnfusedVictim = false;
-                for (unsigned distance = 0; distance < toUpdateRrpvSet.size(); ++distance) {
-                    unsigned way = distance / shortSlots;
-                    if (toUpdateSet[way].fused) {
-                        continue;
-                    }
-                    unsigned rrpv = toUpdateRrpvSet[distance];
-                    if (!foundUnfusedVictim || rrpv > unfusedVictimRrpv) {
-                        unfusedVictimDistance = distance;
-                        unfusedVictimRrpv = rrpv;
-                        foundUnfusedVictim = true;
-                    }
-                }
-                if (foundUnfusedVictim) {
-                    maxRrpvDistance = unfusedVictimDistance;
-                    maxRrpvDistanceBuddy = maxRrpvDistance ^ 1;
-                    maxRrpvWay = maxRrpvDistance / shortSlots;
-                    maxRrpv = toUpdateRrpvSet[maxRrpvDistance];
-                }
+            for (unsigned way = 0; way < numWays; ++way) {
+                UpdateAction candidate;
+                candidate.valid = true;
+                candidate.way = way;
+                candidate.slot = 0;
+                candidate.finalFused = true;
 
-                if (toUpdateSet[maxRrpvWay].fused) {
-                    stats.updateWriteUnfusedOnFusedWay++;
-#ifndef UNIT_TEST
-                    traceState.unfusedOnFusedWay = 1;
-                    traceState.finalWay = maxRrpvWay;
-                    traceState.finalSlot = 0;
-                    traceState.finalFused = 0;
-#endif
-                    DPRINTF(BTBPDede,
-                        "BTBPDede: convert fused->unfused pc=%#lx victimWay=%u\n",
-                        pc, maxRrpvWay);
-                    toUpdateSet[maxRrpvWay].fused = false;
-                    toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
-                    clearLongSlot(toUpdateSet[maxRrpvWay]);
-                    toUpdateSet[maxRrpvWay].shortSlots[0].valid = true;
-                    toUpdateSet[maxRrpvWay].shortSlots[0].bi = BranchInfo(entry);
-                    toUpdateSet[maxRrpvWay].shortSlots[0].bi.resolved = false;
-                    toUpdateSet[maxRrpvWay].shortSlots[1] = MonitorShortSlot();
-                    writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-
-                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
-                    toUpdateRrpvSet[maxRrpvDistanceBuddy] = monitorMaxRrpv;
+                if (isWayInvalid(way)) {
+                    candidate.kind = UpdateActionKind::UseInvalidWay;
+                    candidate.cost = 0;
+                } else if (toUpdateSet[way].fused) {
+                    candidate.kind = UpdateActionKind::ReplaceFusedWay;
+                    candidate.cost = fusedValue(way);
                 } else {
-                    stats.updateWriteReplaceSameType++;
-#ifndef UNIT_TEST
-                    traceState.replaceSameType = 1;
-                    traceState.finalWay = maxRrpvWay;
-                    traceState.finalSlot = maxRrpvDistance % shortSlots;
-                    traceState.finalFused = 0;
-#endif
-                    DPRINTF(BTBPDede,
-                        "BTBPDede: replace same-type pc=%#lx victimWay=%u fused=%d maxRrpvDistance=%u buddy=%u\n",
-                        pc, maxRrpvWay, updateIsFused, maxRrpvDistance, maxRrpvDistanceBuddy);
-                    bool retagged = toUpdateSet[maxRrpvWay].tag != monitorBTBTag;
-                    toUpdateSet[maxRrpvWay].fused = false;
-                    toUpdateSet[maxRrpvWay].tag = monitorBTBTag;
-                    clearLongSlot(toUpdateSet[maxRrpvWay]);
-                    auto writeShortSlot = [&](MonitorShortSlot &slot) {
-                        slot.valid = true;
-                        slot.bi = BranchInfo(entry);
-                        slot.bi.resolved = false;
-                    };
-                    auto invalidateShortSlot = [&](MonitorShortSlot &slot) {
-                        slot = MonitorShortSlot();
-                    };
-                    if (maxRrpvDistance % shortSlots == 0) {
-                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
-                        if (retagged) {
-                            invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
-                        }
-                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[0];
-                    } else {
-                        writeShortSlot(toUpdateSet[maxRrpvWay].shortSlots[1]);
-                        if (retagged) {
-                            invalidateShortSlot(toUpdateSet[maxRrpvWay].shortSlots[0]);
-                        }
-                        writtenSlot = &toUpdateSet[maxRrpvWay].shortSlots[1];
-                    }
+                    candidate.kind = UpdateActionKind::ReplaceUnfusedPair;
+                    candidate.cost = pairValue(way);
+                }
 
-                    std::transform(toUpdateRrpvSet.begin(), toUpdateRrpvSet.end(), toUpdateRrpvSet.begin(),
-                        [&](unsigned rrpv) { return rrpv + (monitorMaxRrpv - maxRrpv); });
-                    toUpdateRrpvSet[maxRrpvDistance] = monitorMaxRrpv - 1;
+                if (betterAction(candidate, chosenAction, false)) {
+                    chosenAction = candidate;
                 }
             }
+        }
+
+        assert(chosenAction.valid);
+        markChosenAction(chosenAction);
+        if (chosenAction.kind != UpdateActionKind::UseSameTagFreeSlot &&
+            chosenAction.kind != UpdateActionKind::UseInvalidWay) {
+            ageMonitorSetOnMiss();
+        }
+
+        switch (chosenAction.kind) {
+          case UpdateActionKind::UseSameTagFreeSlot:
+          case UpdateActionKind::ReplaceSameTagSlot:
+            toUpdateSet[chosenAction.way].fused = false;
+            toUpdateSet[chosenAction.way].tag = monitorBTBTag;
+            clearLongSlot(toUpdateSet[chosenAction.way]);
+            installShortSlot(toUpdateSet[chosenAction.way].shortSlots[chosenAction.slot]);
+            writtenSlot = &toUpdateSet[chosenAction.way].shortSlots[chosenAction.slot];
+            toUpdateRrpvSet[chosenAction.way * shortSlots + chosenAction.slot] =
+                monitorMaxRrpv - 1;
+            break;
+          case UpdateActionKind::UseInvalidWay:
+            if (updateIsFused) {
+                toUpdateSet[chosenAction.way].shortSlots[0] = MonitorShortSlot();
+                toUpdateSet[chosenAction.way].shortSlots[1] = MonitorShortSlot();
+                writeFusedEntry(toUpdateSet[chosenAction.way]);
+                writtenSlot = &toUpdateSet[chosenAction.way].shortSlots[0];
+                toUpdateRrpvSet[chosenAction.way * shortSlots] = monitorMaxRrpv - 1;
+                toUpdateRrpvSet[chosenAction.way * shortSlots + 1] = monitorMaxRrpv - 1;
+            } else {
+                toUpdateSet[chosenAction.way].fused = false;
+                toUpdateSet[chosenAction.way].tag = monitorBTBTag;
+                clearLongSlot(toUpdateSet[chosenAction.way]);
+                toUpdateSet[chosenAction.way].shortSlots[0] = MonitorShortSlot();
+                toUpdateSet[chosenAction.way].shortSlots[1] = MonitorShortSlot();
+                installShortSlot(toUpdateSet[chosenAction.way].shortSlots[0]);
+                writtenSlot = &toUpdateSet[chosenAction.way].shortSlots[0];
+                toUpdateRrpvSet[chosenAction.way * shortSlots] = monitorMaxRrpv - 1;
+                toUpdateRrpvSet[chosenAction.way * shortSlots + 1] = monitorMaxRrpv;
+            }
+            break;
+          case UpdateActionKind::BreakFusedWay:
+          case UpdateActionKind::RetagUnfusedWay:
+            toUpdateSet[chosenAction.way].fused = false;
+            toUpdateSet[chosenAction.way].tag = monitorBTBTag;
+            clearLongSlot(toUpdateSet[chosenAction.way]);
+            toUpdateSet[chosenAction.way].shortSlots[0] = MonitorShortSlot();
+            toUpdateSet[chosenAction.way].shortSlots[1] = MonitorShortSlot();
+            installShortSlot(toUpdateSet[chosenAction.way].shortSlots[0]);
+            writtenSlot = &toUpdateSet[chosenAction.way].shortSlots[0];
+            toUpdateRrpvSet[chosenAction.way * shortSlots] = monitorMaxRrpv - 1;
+            toUpdateRrpvSet[chosenAction.way * shortSlots + 1] = monitorMaxRrpv;
+            break;
+          case UpdateActionKind::ReplaceFusedWay:
+          case UpdateActionKind::ReplaceUnfusedPair:
+            toUpdateSet[chosenAction.way].shortSlots[0] = MonitorShortSlot();
+            toUpdateSet[chosenAction.way].shortSlots[1] = MonitorShortSlot();
+            writeFusedEntry(toUpdateSet[chosenAction.way]);
+            writtenSlot = &toUpdateSet[chosenAction.way].shortSlots[0];
+            toUpdateRrpvSet[chosenAction.way * shortSlots] = monitorMaxRrpv - 1;
+            toUpdateRrpvSet[chosenAction.way * shortSlots + 1] = monitorMaxRrpv - 1;
+            break;
+          case UpdateActionKind::None:
+            panic("BTBPDede: no action selected for update");
         }
     } else { // hit
         if (foundSlot != shortSlots) { // hit short slot
@@ -1259,7 +1331,6 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
         }
     }
 
-_counter_update:
     // counter update
     if (writtenSlot && entry.isCond) {
         int oldCtr = writtenSlot->ctr;
@@ -1327,12 +1398,12 @@ _counter_update:
                 foundWay != numWays && foundSlot != shortSlots,
                 foundWay != numWays && foundSlot == shortSlots,
                 foundWay == numWays, traceState.chooseInvalidWay,
-                traceState.choosePartialInvalidSlot,
-                traceState.replaceSameType,
-                traceState.fuseOnUnfusedWay,
-                traceState.unfusedOnFusedWay,
-                traceState.fusedVictimFused,
-                traceState.fusedVictimUnfused,
+                traceState.chooseSameTagFreeSlot,
+                traceState.chooseReplaceSameTagSlot,
+                traceState.chooseBreakFusedWay,
+                traceState.chooseRetagUnfusedWay,
+                traceState.chooseReplaceFusedWay,
+                traceState.chooseReplaceUnfusedPair,
                 traceState.allocPageEntry,
                 traceState.allocRegionEntry,
                 traceState.reusePageEntry,
@@ -1648,18 +1719,18 @@ BTBPDede::PDedeStats::PDedeStats(statistics::Group *parent) :
         "update lookup hits on long slots"),
     ADD_STAT(updateWriteInvalidWay, statistics::units::Count::get(),
         "updates written into fully invalid way"),
-    ADD_STAT(updateWritePartialInvalidSlot, statistics::units::Count::get(),
-        "updates written into partial invalid slot"),
-    ADD_STAT(updateWriteReplaceSameType, statistics::units::Count::get(),
-        "updates replacing victim with same entry type"),
-    ADD_STAT(updateWriteFuseOnUnfusedWay, statistics::units::Count::get(),
-        "fused updates written on unfused way"),
-    ADD_STAT(updateWriteUnfusedOnFusedWay, statistics::units::Count::get(),
-        "unfused updates written on fused way"),
-    ADD_STAT(updateWriteFusedVictimFused, statistics::units::Count::get(),
-        "fused update chose fused victim way"),
-    ADD_STAT(updateWriteFusedVictimUnfused, statistics::units::Count::get(),
-        "fused update chose unfused victim way"),
+    ADD_STAT(updateWriteSameTagFreeSlot, statistics::units::Count::get(),
+        "short updates written into same-tag free slot"),
+    ADD_STAT(updateWriteReplaceSameTagSlot, statistics::units::Count::get(),
+        "short updates replacing same-tag short slot"),
+    ADD_STAT(updateWriteBreakFusedWay, statistics::units::Count::get(),
+        "short updates breaking fused way"),
+    ADD_STAT(updateWriteRetagUnfusedWay, statistics::units::Count::get(),
+        "short updates retagging unfused way"),
+    ADD_STAT(updateWriteReplaceFusedWay, statistics::units::Count::get(),
+        "fused updates replacing fused way"),
+    ADD_STAT(updateWriteReplaceUnfusedPair, statistics::units::Count::get(),
+        "fused updates replacing unfused pair"),
     ADD_STAT(allBranchHits, statistics::units::Count::get(),
         "all types of branches committed that was predicted hit"),
     ADD_STAT(totalBranchHits, statistics::units::Count::get(), "Total number of branch hits in BTB"),

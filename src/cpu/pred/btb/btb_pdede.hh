@@ -222,10 +222,13 @@ private:
                  uint64_t vpnUpper, uint64_t foundWay, uint64_t foundSlot,
                  uint64_t lookupHitWay, uint64_t lookupHitShortSlot,
                  uint64_t lookupHitLongSlot, uint64_t lookupMiss,
-                 uint64_t chooseInvalidWay, uint64_t choosePartialInvalidSlot,
-                 uint64_t replaceSameType, uint64_t fuseOnUnfusedWay,
-                 uint64_t unfusedOnFusedWay, uint64_t fusedVictimFused,
-                 uint64_t fusedVictimUnfused, uint64_t allocPageEntry,
+                 uint64_t chooseInvalidWay, uint64_t chooseSameTagFreeSlot,
+                 uint64_t chooseReplaceSameTagSlot,
+                 uint64_t chooseBreakFusedWay,
+                 uint64_t chooseRetagUnfusedWay,
+                 uint64_t chooseReplaceFusedWay,
+                 uint64_t chooseReplaceUnfusedPair,
+                 uint64_t allocPageEntry,
                  uint64_t allocRegionEntry, uint64_t reusePageEntry,
                  uint64_t reuseRegionEntry, uint64_t counterUpdate,
                  uint64_t finalWay, uint64_t finalSlot, uint64_t finalFused,
@@ -258,12 +261,12 @@ private:
             _uint64_data["lookupHitLongSlot"] = lookupHitLongSlot;
             _uint64_data["lookupMiss"] = lookupMiss;
             _uint64_data["chooseInvalidWay"] = chooseInvalidWay;
-            _uint64_data["choosePartialInvalidSlot"] = choosePartialInvalidSlot;
-            _uint64_data["replaceSameType"] = replaceSameType;
-            _uint64_data["fuseOnUnfusedWay"] = fuseOnUnfusedWay;
-            _uint64_data["unfusedOnFusedWay"] = unfusedOnFusedWay;
-            _uint64_data["fusedVictimFused"] = fusedVictimFused;
-            _uint64_data["fusedVictimUnfused"] = fusedVictimUnfused;
+            _uint64_data["chooseSameTagFreeSlot"] = chooseSameTagFreeSlot;
+            _uint64_data["chooseReplaceSameTagSlot"] = chooseReplaceSameTagSlot;
+            _uint64_data["chooseBreakFusedWay"] = chooseBreakFusedWay;
+            _uint64_data["chooseRetagUnfusedWay"] = chooseRetagUnfusedWay;
+            _uint64_data["chooseReplaceFusedWay"] = chooseReplaceFusedWay;
+            _uint64_data["chooseReplaceUnfusedPair"] = chooseReplaceUnfusedPair;
             _uint64_data["allocPageEntry"] = allocPageEntry;
             _uint64_data["allocRegionEntry"] = allocRegionEntry;
             _uint64_data["reusePageEntry"] = reusePageEntry;
@@ -309,12 +312,12 @@ private:
         Scalar updateLookupHitLongSlot;
 
         Scalar updateWriteInvalidWay;
-        Scalar updateWritePartialInvalidSlot;
-        Scalar updateWriteReplaceSameType;
-        Scalar updateWriteFuseOnUnfusedWay;
-        Scalar updateWriteUnfusedOnFusedWay;
-        Scalar updateWriteFusedVictimFused;
-        Scalar updateWriteFusedVictimUnfused;
+        Scalar updateWriteSameTagFreeSlot;
+        Scalar updateWriteReplaceSameTagSlot;
+        Scalar updateWriteBreakFusedWay;
+        Scalar updateWriteRetagUnfusedWay;
+        Scalar updateWriteReplaceFusedWay;
+        Scalar updateWriteReplaceUnfusedPair;
 
         Scalar allBranchHits;
         Scalar totalBranchHits;
