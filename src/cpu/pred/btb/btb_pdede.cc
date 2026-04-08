@@ -711,9 +711,9 @@ void BTBPDede::updateResolvedEntry(const BTBEntry &entry, const FetchTarget &str
     bool isMispredict = stream.squashType == SQUASH_CTRL && stream.squashPC == pc;
     bool thisBranchTaken = stream.exeTaken && stream.exeBranchInfo.pc == pc;
 
-    // if (entry.isIndirect && thisBranchTaken && isMispredict) {
-    //     target = stream.exeBranchInfo.target;
-    // }
+    if (entry.isIndirect && thisBranchTaken && isMispredict) {
+        target = stream.exeBranchInfo.target;
+    }
 
     unsigned dist = distance(pc, target);
 
