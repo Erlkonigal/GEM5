@@ -592,7 +592,7 @@ void BTBPDede::update(const FetchTarget& stream) {
         BranchInfo exec = entry_to_update;
 
         if (stream.exeBranchInfo.pc == exec.pc && stream.exeTaken && stream.exeBranchInfo.isIndirect) {
-            // exec.target = stream.exeBranchInfo.target;
+            exec.target = stream.exeBranchInfo.target;
         }
 
         unsigned alignedBankIdx = getRotatedAlignBankIdx(exec.pc, 0);
